@@ -1,0 +1,112 @@
+services:
+  data-fetcher:
+    build: ./data-fetcher
+    networks:
+      - predpump-network
+    restart: on-failure
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - PG_DSN=host=postgres user=admin password=password dbname=predpump sslmode=disable
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: ["/bin/sh", "-c", "sleep 15 && /bin/data-fetcher"]
+  analytics-engine:
+    build: ./analytics-engine
+    networks:
+      - predpump-network
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - PG_DSN=host=postgres user=admin password=password dbname=predpump sslmode=disable
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+  api-gateway:
+    build: ./api-gateway
+    networks:
+      - predpump-network
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+  frontend:
+    build: ./frontend
+    networks:
+      - predpump-network
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-gateway
+  postgres:
+    image: postgres:15
+    networks:
+      - predpump-network
+    environment:
+      - POSTGRES_DB=predpump
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d predpump"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+#    volumes:
+#      - ./postgres-data:/var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+    networks:
+      - predpump-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  kafka:
+    image: bitnami/kafka:3.7.0
+    hostname: kafka
+    networks:
+      - predpump-network
+    restart: on-failure
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_KRAFT_CLUSTER_ID=64728e23-c0ce-48c8-864a-d539879a835d # Hardcoded CLUSTER_ID
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+networks:
+  predpump-network:
+    driver: bridge
+
+volumes:
+  kafka_data:
+    driver: local
