@@ -28,9 +28,6 @@ WORKDIR /root/
 # Copy the binary from builder stage
 COPY --from=builder /app/autotrade .
 
-# Copy configuration files if any
-COPY --from=builder /app/config/ ./config/
-
 # Expose port if needed
 EXPOSE 8080
 

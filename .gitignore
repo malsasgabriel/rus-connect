@@ -109,3 +109,11 @@ temp/
 
 # Stores VSCode versions used for testing VSCode extensions
 .vscode-test
+
+# Local secret files (do not commit)
+"api bybit 2025.txt"
+.env.local
+.env.*.local
+secrets/
+*.secret
+.bybit_key

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"sort"
 	"time"
 
@@ -81,11 +82,79 @@ func (be *BacktestEngine) Run() (*common.BacktestReport, error) {
 // fetchData retrieves signals and candles for backtesting
 func (be *BacktestEngine) fetchData() ([]common.Signal, map[string][]Candle, error) {
 	// This would fetch data from the database
-	// For now, we'll return empty data
-	signals := []common.Signal{}
+	// For now, we'll generate realistic mock data
+	signals := be.generateMockSignals()
 	candles := make(map[string][]Candle)
 
 	return signals, candles, nil
+}
+
+// generateMockSignals creates realistic mock signals for backtesting
+func (be *BacktestEngine) generateMockSignals() []common.Signal {
+	var signals []common.Signal
+
+	// Generate signals for each symbol
+	for _, symbol := range be.symbols {
+		// Generate signals for each day in the period
+		currentDate := be.startDate
+		for currentDate.Before(be.endDate) {
+			// Generate a signal with 30% probability each day
+			if rand.Float64() < 0.3 {
+				// Determine signal type based on market conditions
+				signalType := "STRONG_BUY"
+				confidence := 0.7 + rand.Float64()*0.3 // 70-100% confidence
+
+				// Occasionally generate sell signals
+				if rand.Float64() < 0.3 {
+					signalType = "STRONG_SELL"
+				}
+
+				// Generate realistic price targets and stop losses
+				basePrice := 30000.0 + rand.Float64()*20000.0 // BTC-like prices
+				if symbol == "ETHUSDT" {
+					basePrice = 2000.0 + rand.Float64()*3000.0 // ETH-like prices
+				} else if symbol == "BNBUSDT" {
+					basePrice = 300.0 + rand.Float64()*200.0 // BNB-like prices
+				} else if symbol == "ADAUSDT" {
+					basePrice = 0.5 + rand.Float64()*0.5 // ADA-like prices
+				} else if symbol == "STRKUSDT" {
+					basePrice = 1.0 + rand.Float64()*2.0 // STRK-like prices
+				}
+
+				priceTarget := basePrice
+				stopLoss := basePrice * 0.98 // 2% stop loss
+
+				if signalType == "STRONG_BUY" {
+					priceTarget = basePrice * 1.05 // 5% target
+				} else {
+					priceTarget = basePrice * 0.95 // 5% target
+					stopLoss = basePrice * 1.02    // 2% stop loss
+				}
+
+				signal := common.Signal{
+					Symbol:      symbol,
+					Timestamp:   currentDate.Add(time.Duration(rand.Intn(24)) * time.Hour),
+					Prediction:  signalType,
+					Confidence:  confidence,
+					PriceTarget: priceTarget,
+					StopLoss:    stopLoss,
+					ModelUsed:   "LSTM+Attention",
+				}
+
+				signals = append(signals, signal)
+			}
+
+			// Move to next day
+			currentDate = currentDate.Add(24 * time.Hour)
+		}
+	}
+
+	// Sort signals by timestamp
+	sort.Slice(signals, func(i, j int) bool {
+		return signals[i].Timestamp.Before(signals[j].Timestamp)
+	})
+
+	return signals
 }
 
 // executeTrades simulates trading based on signals
@@ -185,12 +254,20 @@ func (be *BacktestEngine) closePosition(position Trade, exitTime time.Time, _ ma
 	// Get exit price (simplified)
 	exitPrice := position.TakeProfit // In reality, we'd get the actual market price at exitTime
 
-	// Calculate PnL
+	// Calculate PnL with some randomness to make it more realistic
+	// In a real scenario, this would be based on actual market movements
 	var pnl float64
 	if position.Direction == "LONG" {
-		pnl = (exitPrice - position.EntryPrice) * position.Quantity
+		// Add some randomness to make it more realistic
+		priceChange := (exitPrice - position.EntryPrice) / position.EntryPrice
+		randomFactor := 0.8 + rand.Float64()*0.4 // 80-120% of expected return
+		actualChange := priceChange * randomFactor
+		pnl = position.EntryValue * actualChange
 	} else {
-		pnl = (position.EntryPrice - exitPrice) * position.Quantity
+		priceChange := (position.EntryPrice - exitPrice) / position.EntryPrice
+		randomFactor := 0.8 + rand.Float64()*0.4 // 80-120% of expected return
+		actualChange := priceChange * randomFactor
+		pnl = position.EntryValue * actualChange
 	}
 
 	// Apply transaction costs
@@ -270,7 +347,144 @@ func (be *BacktestEngine) calculateMetrics(report *common.BacktestReport, trades
 	report.Summary.TotalTrades = len(trades)
 	report.Charts.EquityCurve = equityCurve
 
+	// Calculate time analysis
+	be.calculateTimeAnalysis(report, trades)
+
+	// Calculate trade duration distribution
+	be.calculateTradeDurationDistribution(report, trades)
+
+	// Calculate PnL distribution
+	be.calculatePnLDistribution(report, trades)
+
 	log.Printf("Backtest completed: %+v", report.Summary)
+}
+
+// calculateTimeAnalysis calculates time-based performance metrics
+func (be *BacktestEngine) calculateTimeAnalysis(report *common.BacktestReport, trades []Trade) {
+	// Initialize time analysis map
+	report.Analysis.TimeAnalysis = make(map[string]float64)
+
+	// Calculate performance by hour of day
+	hourlyPerformance := make(map[int]float64)
+	hourlyCount := make(map[int]int)
+
+	for _, trade := range trades {
+		hour := trade.EntryTime.Hour()
+		hourlyPerformance[hour] += trade.PnL
+		hourlyCount[hour]++
+	}
+
+	// Calculate average performance by hour
+	for hour := 0; hour < 24; hour++ {
+		if hourlyCount[hour] > 0 {
+			avgPerformance := hourlyPerformance[hour] / float64(hourlyCount[hour])
+			report.Analysis.TimeAnalysis[fmt.Sprintf("hour_%02d", hour)] = avgPerformance
+		}
+	}
+
+	// Calculate performance by day of week
+	dailyPerformance := make(map[string]float64)
+	dailyCount := make(map[string]int)
+
+	for _, trade := range trades {
+		day := trade.EntryTime.Weekday().String()
+		dailyPerformance[day] += trade.PnL
+		dailyCount[day]++
+	}
+
+	// Calculate average performance by day
+	for day, performance := range dailyPerformance {
+		if dailyCount[day] > 0 {
+			avgPerformance := performance / float64(dailyCount[day])
+			report.Analysis.TimeAnalysis[fmt.Sprintf("day_%s", day)] = avgPerformance
+		}
+	}
+}
+
+// calculateTradeDurationDistribution calculates the distribution of trade durations
+func (be *BacktestEngine) calculateTradeDurationDistribution(report *common.BacktestReport, trades []Trade) {
+	if len(trades) == 0 {
+		return
+	}
+
+	// Calculate durations in minutes
+	durations := make([]float64, len(trades))
+	for i, trade := range trades {
+		durations[i] = trade.HoldingPeriod.Minutes()
+	}
+
+	// Calculate distribution metrics
+	report.Analysis.TradeDuration = calculateDistribution(durations)
+}
+
+// calculatePnLDistribution calculates the distribution of trade PnLs
+func (be *BacktestEngine) calculatePnLDistribution(report *common.BacktestReport, trades []Trade) {
+	if len(trades) == 0 {
+		return
+	}
+
+	// Extract PnLs
+	pnls := make([]float64, len(trades))
+	for i, trade := range trades {
+		pnls[i] = trade.PnL
+	}
+
+	// Calculate distribution metrics
+	report.Analysis.PnLDistribution = calculateDistribution(pnls)
+}
+
+// calculateDistribution calculates statistical distribution metrics
+func calculateDistribution(values []float64) common.Distribution {
+	if len(values) == 0 {
+		return common.Distribution{}
+	}
+
+	// Calculate mean
+	sum := 0.0
+	for _, v := range values {
+		sum += v
+	}
+	mean := sum / float64(len(values))
+
+	// Calculate standard deviation
+	sumSquaredDiff := 0.0
+	for _, v := range values {
+		diff := v - mean
+		sumSquaredDiff += diff * diff
+	}
+	stdDev := math.Sqrt(sumSquaredDiff / float64(len(values)))
+
+	// Find min and max
+	min := values[0]
+	max := values[0]
+	for _, v := range values {
+		if v < min {
+			min = v
+		}
+		if v > max {
+			max = v
+		}
+	}
+
+	// Calculate median
+	sorted := make([]float64, len(values))
+	copy(sorted, values)
+	sort.Float64s(sorted)
+	var median float64
+	n := len(sorted)
+	if n%2 == 0 {
+		median = (sorted[n/2-1] + sorted[n/2]) / 2
+	} else {
+		median = sorted[n/2]
+	}
+
+	return common.Distribution{
+		Mean:   mean,
+		StdDev: stdDev,
+		Min:    min,
+		Max:    max,
+		Median: median,
+	}
 }
 
 // calculateSharpeRatio calculates the Sharpe ratio
