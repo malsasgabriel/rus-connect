@@ -1,0 +1,38 @@
+# Build stage
+FROM golang:1.19-alpine AS builder
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod and sum files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN go build -o autotrade cmd/autotrade/main.go
+
+# Final stage
+FROM alpine:latest
+
+# Install ca-certificates for HTTPS requests
+RUN apk --no-cache add ca-certificates
+
+# Set working directory
+WORKDIR /root/
+
+# Copy the binary from builder stage
+COPY --from=builder /app/autotrade .
+
+# Copy configuration files if any
+COPY --from=builder /app/config/ ./config/
+
+# Expose port if needed
+EXPOSE 8080
+
+# Command to run the binary
+CMD ["./autotrade", "--mode=demo", "--symbols=BTCUSDT", "--capital=1000", "--risk=medium"]
