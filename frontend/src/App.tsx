@@ -7,6 +7,10 @@ import { ProgressBar } from './components/ProgressBar';
 import { StatusDashboard } from './components/StatusDashboard';
 import { LearningDashboard } from './components/LearningDashboard';
 import { TradingSignalDashboard } from './components/TradingSignalDashboard';
+import { MLDashboard } from './components/MLDashboard';
+import { AdvancedTraderMind } from './components/AdvancedTraderMind';
+import { ModelVotingPanel } from './components/ModelVotingPanel';
+import { TraderMindFull } from './components/TraderMindFull';
 
 const API_GATEWAY_WS = import.meta.env.VITE_API_GATEWAY_WS || 'ws://localhost:8080/ws';
 
@@ -18,7 +22,9 @@ const App: React.FC = () => {
   const [pumpSignalsCount, setPumpSignalsCount] = useState<number>(0);
   const [mlSignalsCount, setMlSignalsCount] = useState<number>(0);
   const [progress, setProgress] = useState<number>(0); // For overall system progress
-  const [activeTab, setActiveTab] = useState<'market' | 'learning' | 'signals'>('market');
+  const [activeTab, setActiveTab] = useState<'market' | 'learning' | 'signals' | 'ml' | 'trader'>('trader');
+  // add trader mind tab state
+  // ...existing code...
 
   useEffect(() => {
     const ws = new WebSocket(API_GATEWAY_WS);
@@ -91,7 +97,7 @@ const App: React.FC = () => {
           price_change_pct: 0, // Calculate based on target vs current
           risk_level: dirSignal.confidence > 0.7 ? 'LOW' : 
                      dirSignal.confidence > 0.5 ? 'MEDIUM' : 'HIGH',
-          model_used: dirSignal.model_used || 'LSTM+Attention',
+          model_used: dirSignal.model_used || 'unknown',
           time_horizon: `${dirSignal.time_horizon || 60}min`,
           timestamp: dirSignal.timestamp || Date.now() / 1000,
           volatility: 0.02, // Default volatility
@@ -136,7 +142,10 @@ const App: React.FC = () => {
     <div className="min-h-screen bg-gray-900 text-white p-4">
       {/* ✅ ToastContainer completely removed to eliminate all popup notifications */}
       <header className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold">PredPump Radar</h1>
+        <div className="flex items-baseline space-x-3">
+          <h1 className="text-3xl font-bold">PredPump Radar</h1>
+          <span className="text-sm text-gray-400">(build: {new Date().toLocaleString()})</span>
+        </div>
         <div className="flex items-center space-x-4">
           <span className={`text-sm ${connectionStatus === 'connected' ? 'text-green-500' : 'text-red-500'}`}>
             WS Status: {connectionStatus}
@@ -181,6 +190,26 @@ const App: React.FC = () => {
         >
           🧠 Learning Dashboard
         </button>
+        <button
+          onClick={() => setActiveTab('ml')}
+          className={`px-4 py-2 rounded font-medium ${
+            activeTab === 'ml'
+              ? 'bg-blue-600 text-white'
+              : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+          }`}
+        >
+          🤖 ML Metrics
+        </button>
+        <button
+          onClick={() => setActiveTab('trader')}
+          className={`px-4 py-2 rounded font-medium ${
+            activeTab === 'trader'
+              ? 'bg-green-600 text-white'
+              : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+          }`}
+        >
+          🧠 Trader Mind
+        </button>
       </div>
 
       {activeTab === 'market' && (
@@ -207,6 +236,27 @@ const App: React.FC = () => {
       {activeTab === 'learning' && (
         <LearningDashboard />
       )}
+
+      {activeTab === 'trader' && (
+        <>
+          <AdvancedTraderMind />
+          <div className="mt-6">
+            <TraderMindFull />
+          </div>
+        </>
+      )}
+      {activeTab === 'ml' && (
+        <MLDashboard />
+      )}
+
+      {/* Floating quick-open button for Trader Mind (visible even if nav is missing) */}
+      <button
+        onClick={() => setActiveTab('trader')}
+        aria-label="Open Trader Mind"
+        className="fixed right-4 bottom-4 z-50 px-4 py-2 bg-green-600 hover:bg-green-500 rounded-full shadow-lg text-white"
+      >
+        🧠 Trader Mind
+      </button>
     </div>
   );
 };

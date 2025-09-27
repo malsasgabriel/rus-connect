@@ -1,504 +1,201 @@
-# 🚀 Advanced ML Cryptocurrency Trading System - 65-75% Accuracy Target
+# 🚀 Rus-Connect: Система Криптовалютного Трейдинга на Базе ИИ
 
-A high-performance, self-learning cryptocurrency trading system featuring **Ensemble AI Models** with LSTM + XGBoost + Transformer + Meta-Learner for achieving **65-75% prediction accuracy** with explainable AI and adaptive risk management.
+**Rus-Connect** — это комплексная, самообучающаяся система для криптовалютного трейдинга, использующая ансамбль моделей машинного обучения (LSTM, XGBoost, Transformer) для генерации торговых сигналов с целевой точностью 65-75%. Система оснащена объяснимым ИИ, адаптивным управлением рисками и веб-интерфейсом для мониторинга в реальном времени.
 
-## 🎯 System Overview
+![Frontend Screenshot](https://i.imgur.com/your-screenshot.png) <!-- Замените на актуальный скриншот -->
 
-This system transforms raw cryptocurrency market data into high-accuracy trading signals using:
-- **🧠 Ensemble AI Models** - LSTM + XGBoost + Transformer + Meta-Learner combination
-- **📊 Advanced Feature Engineering** - 50+ normalized features including Fibonacci, Order Book, Time-based
-- **🔍 Explainable AI** - SHAP values and detailed prediction explanations
-- **🛡️ Adaptive Risk Management** - Dynamic thresholds and position sizing
-- **📈 Real-time Learning** - Continuous model improvement from market outcomes
-- **🎯 Target Accuracy: 65-75%** - Honest, high-confidence signals only
+## 🎯 Ключевые Особенности
 
-## 🏗️ Architecture
+- **🧠 Ансамбль ИИ-моделей**: Комбинация LSTM, XGBoost и Transformer для повышения точности прогнозов.
+- **📊 Продвинутая Инженерия Признаков**: Более 50 нормализованных признаков, включая технические индикаторы, данные из стакана ордеров и временные метрики.
+- **🔍 Объяснимый ИИ (XAI)**: Детальный анализ каждого сигнала, позволяющий понять, на чем основано решение модели.
+- **🛡️ Адаптивное Управление Рисками**: Динамические пороги уверенности и стоп-лоссы для минимизации потерь.
+- **📈 Обучение в Реальном Времени**: Модели постоянно дообучаются на новых рыночных данных для адаптации к изменяющимся условиям.
+- **🖥️ Интерактивный Веб-интерфейс**: Панель мониторинга для отслеживания сигналов, производительности моделей и состояния системы.
 
+## 🏗️ Архитектура Системы
+
+Система состоит из набора микросервисов, работающих в Docker-контейнерах и взаимодействующих через Kafka.
+
+```mermaid
+graph TD
+    subgraph "Инфраструктура"
+        A[Data Fetcher] --> B{Kafka};
+        B --> C[Analytics Engine];
+        C --> B;
+        D[API Gateway] --> C;
+        E[Frontend] --> D;
+        C --> F[PostgreSQL];
+    end
+
+    subgraph "Пользователь"
+        G[Браузер] --> E;
+    end
+
+    style A fill:#2a9d8f,stroke:#333,stroke-width:2px
+    style C fill:#e9c46a,stroke:#333,stroke-width:2px
+    style D fill:#f4a261,stroke:#333,stroke-width:2px
+    style E fill:#e76f51,stroke:#333,stroke-width:2px
+    style F fill:#264653,stroke:#333,stroke-width:2px
+    style B fill:#264653,stroke:#333,stroke-width:2px
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Data Fetcher  │───▶│ Analytics Engine │───▶│   API Gateway   │
-│   (Bybit API)   │    │  (Advanced ML)   │    │  (REST + WS)    │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│     Kafka       │    │   PostgreSQL    │    │    Frontend     │
-│  (Message Bus)  │    │   (Storage)     │    │  (React + TS)   │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-```
 
-## 📋 Prerequisites
+- **Data Fetcher**: Получает рыночные данные (свечи) с биржи Bybit и отправляет их в Kafka.
+- **Analytics Engine**: Ядро системы. Потребляет данные из Kafka, обрабатывает их, генерирует прогнозы с помощью ИИ-моделей и отправляет сигналы обратно в Kafka. Также предоставляет API для получения метрик.
+- **API Gateway**: Предоставляет REST API и WebSocket для фронтенда, агрегируя данные из `Analytics Engine` и других сервисов.
+- **Frontend**: Веб-приложение на React/TypeScript для визуализации данных и взаимодействия с системой.
+- **PostgreSQL**: База данных для хранения исторических данных, сгенерированных сигналов, весов моделей и метрик производительности.
+- **Kafka**: Брокер сообщений для асинхронного взаимодействия между сервисами.
+- **Redis**: Кэш для временного хранения данных.
 
-- **Docker Desktop** (v4.0+) - **MUST BE RUNNING**
-- **Docker Compose** (v2.0+)
-- **PowerShell** (Windows) or **Bash** (Linux/Mac)
-- **8GB RAM** minimum (16GB recommended)
-- **5GB free disk space**
-- **Internet connection** for API access
+## 📋 Требования к Системе
 
-> ⚠️ **IMPORTANT**: Make sure Docker Desktop is running before executing any commands!
+- **Docker Desktop**: Версия 4.0+ (обязательно должен быть запущен).
+- **Docker Compose**: Версия 2.0+.
+- **ОС**: Windows (с PowerShell), macOS или Linux.
+- **ОЗУ**: Минимум 8 ГБ (рекомендуется 16 ГБ).
+- **Место на диске**: 5 ГБ свободного места.
+- **Интернет-соединение**.
 
-## 🚀 Quick Start
+> ⚠️ **ВАЖНО**: Перед выполнением любых команд убедитесь, что Docker Desktop запущен и работает!
 
-### 1. Clone and Navigate
-```powershell
-git clone <repository-url>
+## 🚀 Быстрый Запуск
+
+Процесс развертывания полностью автоматизирован с помощью Docker Compose.
+
+### 1. Клонирование Репозитория
+Откройте терминал и выполните команду:
+```bash
+git clone https://github.com/malsasgabriel/rus-connect.git
 cd rus-connect
 ```
 
-### 2. Clone and Navigate
-```powershell
-git clone <repository-url>
-cd rus-connect
+### 2. Сборка и Запуск Контейнеров
+Эта команда соберет образы всех сервисов и запустит их в фоновом режиме.
+```bash
+docker-compose up --build -d
 ```
+Первая сборка может занять 10-15 минут в зависимости от скорости вашего интернет-соединения и мощности компьютера.
 
-### 3. Build and Start Complete System
-```powershell
-docker-compose build
-docker-compose up -d
-```
-
-### 4. Verify Services
-```powershell
+### 3. Проверка Статуса Сервисов
+Убедитесь, что все контейнеры запущены и находятся в состоянии `Up` или `healthy`.
+```bash
 docker-compose ps
 ```
-
-Expected output:
+Вы должны увидеть примерно следующий вывод:
 ```
-NAME                             STATUS
-rus-connect-analytics-engine-1   Up
-rus-connect-api-gateway-1        Up  
-rus-connect-data-fetcher-1       Up
-rus-connect-frontend-1           Up
-rus-connect-kafka-1              Up (healthy)
-rus-connect-postgres-1           Up (healthy)
-rus-connect-redis-1              Up (healthy)
-```
-
-### 4. Access Web Interface
-Open browser: **http://localhost:3000**
-
-## 🔧 Individual Module Management
-
-### Analytics Engine (Core ML)
-```powershell
-# Start only analytics engine
-docker-compose up analytics-engine -d
-
-# View real-time logs
-docker-compose logs -f analytics-engine
-
-# Check ML predictions
-docker-compose logs analytics-engine | findstr "HONEST SIGNAL"
-
-# Restart with new code
-docker-compose build analytics-engine
-docker-compose up analytics-engine -d
+NAME                               STATUS              PORTS
+rus-connect-analytics-engine-1     Up (healthy)        0.0.0.0:8081->8081/tcp
+rus-connect-api-gateway-1          Up                  0.0.0.0:8080->8080/tcp
+rus-connect-data-fetcher-1         Up
+rus-connect-frontend-1             Up                  0.0.0.0:3000->3000/tcp
+rus-connect-kafka-1                Up (healthy)        0.0.0.0:9092->9092/tcp
+rus-connect-postgres-1             Up (healthy)        0.0.0.0:5432->5432/tcp
+rus-connect-redis-1                Up (healthy)        6379/tcp
 ```
 
-### Data Fetcher (Market Data)
-```powershell
-# Start data fetcher
-docker-compose up data-fetcher -d
-
-# Monitor data flow
-docker-compose logs -f data-fetcher
-
-# Check API connections
-docker-compose logs data-fetcher | findstr "Connected to Bybit"
-```
-
-### Frontend (Web Interface)
-```powershell
-# Start frontend only
-docker-compose up frontend -d
-
-# Rebuild frontend
-docker-compose build frontend
-docker-compose up frontend -d
-
-# Check frontend logs
-docker-compose logs -f frontend
-```
-
-### API Gateway (REST API)
-```powershell
-# Start API gateway
-docker-compose up api-gateway -d
-
-# Test REST endpoints
-curl http://localhost:8080/api/market-data
-curl http://localhost:8080/api/trading-signals
-
-# Monitor API requests
-docker-compose logs -f api-gateway
-```
-
-### Database (PostgreSQL)
-```powershell
-# Start database
-docker-compose up postgres -d
-
-# Connect to database
-docker-compose exec postgres psql -U admin -d predpump
-
-# View ML model data
-docker-compose exec postgres psql -U admin -d predpump -c "\dt"
-```
-
-### Message Bus (Kafka)
-```powershell
-# Start Kafka
-docker-compose up kafka -d
-
-# List topics
-docker-compose exec kafka kafka-topics.sh --list --bootstrap-server localhost:9092
-
-# Monitor messages
-docker-compose exec kafka kafka-console-consumer.sh --topic direction_signals --bootstrap-server localhost:9092
-```
-
-## 🧪 Testing & Validation
-
-### System Health Check
-```powershell
-# Check all services
-docker-compose ps
-
-# Verify ML signals generation
-docker-compose logs analytics-engine | findstr "🎯 HONEST SIGNAL"
-
-# Check signal confidence levels
-docker-compose logs analytics-engine | findstr "confidence"
-```
-
-### ML Model Testing
-```powershell
-# Monitor advanced ML engine initialization
-docker-compose logs analytics-engine | findstr "🧠 Advanced ML Engine"
-
-# Check model accuracy improvements
-docker-compose logs analytics-engine | findstr "accuracy"
-
-# Verify training progress
-docker-compose logs analytics-engine | findstr "Training completed"
-```
-
-### Database Testing
-```powershell
-# Connect to database
-docker-compose exec postgres psql -U admin -d predpump
-
-# Check market data storage
-SELECT COUNT(*) FROM candle_cache;
-
-# Check ML models
-SELECT symbol, accuracy FROM smart_models;
-
-# Check trading signals
-SELECT symbol, prediction, confidence FROM direction_predictions ORDER BY created_at DESC LIMIT 10;
-
-# Check performance metrics
-SELECT * FROM model_performance ORDER BY created_at DESC LIMIT 5;
-```
-
-### API Testing
-```powershell
-# Test market data endpoint
-curl http://localhost:8080/api/market-data | jq
-
-# Test trading signals endpoint  
-curl http://localhost:8080/api/trading-signals | jq
-
-# Test WebSocket connection
-# Use browser dev tools: new WebSocket('ws://localhost:8080/ws')
-```
-
-### Frontend Testing
-1. Open **http://localhost:3000**
-2. Check **Trading Signals Dashboard** table
-3. Verify signals appear without popups
-4. Monitor real-time updates
-5. Check signal confidence levels (should be 65%+)
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-#### 1. Docker Desktop Not Running (Windows)
-**Error**: `unable to get image 'rus-connect-analytics-engine': error during connect: Get "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.51/images/..." open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.`
-
-**Solution**:
-1. **Start Docker Desktop**:
-   - Click Start Menu → Search "Docker Desktop" → Open
-   - Wait for Docker Engine to start (green whale icon in system tray)
-   - Ensure "Use WSL 2 based engine" is enabled in Settings
-
-2. **Verify Docker is running**:
-   ```powershell
-   docker --version
-   docker ps
-   ```
-
-3. **If Docker Desktop won't start**:
-   - Run as Administrator
-   - Enable "Windows Subsystem for Linux" feature
-   - Restart computer if prompted
-   - Update Docker Desktop to latest version
-
-#### 2. Services Won't Start
-```powershell
-# Check Docker daemon
-docker --version
-docker-compose --version
-
-# Restart Docker Desktop
-# Then retry: docker-compose up -d
-```
-
-#### 2. Database Connection Failed
-```powershell
-# Check PostgreSQL logs
-docker-compose logs postgres
-
-# Restart database
-docker-compose restart postgres
-
-# Wait for health check
-docker-compose ps | findstr postgres
-```
-
-#### 3. Low Signal Confidence
-```powershell
-# Check ML engine logs
-docker-compose logs analytics-engine | findstr "confidence"
-
-# Verify advanced ML engine is active
-docker-compose logs analytics-engine | findstr "🧠 Advanced ML"
-
-# Check historical data loading
-docker-compose logs analytics-engine | findstr "historical"
-```
-
-#### 4. No Trading Signals
-```powershell
-# Check data fetcher
-docker-compose logs data-fetcher | findstr "Connected"
-
-# Verify Kafka messages
-docker-compose exec kafka kafka-topics.sh --list --bootstrap-server localhost:9092
-
-# Check analytics engine processing
-docker-compose logs analytics-engine | findstr "candles needed"
-```
-
-#### 5. Frontend Not Loading
-```powershell
-# Check frontend service
-docker-compose logs frontend
-
-# Rebuild and restart
-docker-compose build frontend
-docker-compose up frontend -d
-
-# Check port binding
-netstat -an | findstr :3000
-```
-
-### Debug Commands
-
-```powershell
-# View all service logs
-docker-compose logs
-
-# Check specific service health
-docker-compose exec analytics-engine ps aux
-
-# Monitor resource usage
-docker stats
-
-# Clean restart everything
-docker-compose down
-docker-compose up -d
-
-# Reset database (WARNING: deletes all data)
-docker-compose down -v
-docker-compose up -d
-```
-
-## 📊 Performance Monitoring
-
-### Key Metrics to Monitor
-
-1. **Signal Quality**
-   ```powershell
-   # Check confidence levels
-   docker-compose logs analytics-engine | findstr "confidence" | tail -20
-   ```
-
-2. **Model Accuracy**
-   ```powershell
-   # Check training progress
-   docker-compose logs analytics-engine | findstr "accuracy" | tail -10
-   ```
-
-3. **Data Flow**
-   ```powershell
-   # Monitor candle processing
-   docker-compose logs analytics-engine | findstr "candles" | tail -15
-   ```
-
-4. **System Performance**
-   ```powershell
-   # Resource usage
-   docker stats --no-stream
-   ```
-
-### Expected Performance
-- **Signal Confidence:** 65-80% (honest signals only)
-- **Prediction Frequency:** 1-5 signals per hour per symbol
-- **Model Accuracy:** Improves over time (55%+ baseline)
-- **Response Time:** <2 seconds for real-time updates
-
-## 🔧 Configuration
-
-### Environment Variables
-Create `.env` file:
-```env
-# Database
-PG_DSN=host=postgres user=admin password=password dbname=predpump sslmode=disable
-
-# Kafka
-KAFKA_BROKERS=kafka:9092
-
-# API
-API_PORT=8080
-
-# ML Settings
-CONFIDENCE_THRESHOLD=0.65
-MIN_ACCURACY=0.55
-```
-
-### Advanced ML Configuration
-Edit `analytics-engine/advanced_ml_engine.go`:
-```go
-confidenceThreshold: 0.65  // Minimum 65% for signal emission
-minAccuracy: 0.55          // Minimum model accuracy 55%
-adaptiveLearning: true     // Enable continuous learning
-```
-
-## 📚 API Documentation
-
-### REST Endpoints
-
-#### Market Data
-```
-GET /api/market-data
-Response: Current market data for all symbols
-```
-
-#### Trading Signals  
-```
-GET /api/trading-signals
-Response: Latest ML trading signals with confidence levels
-```
-
-### WebSocket Events
-```javascript
-const ws = new WebSocket('ws://localhost:8080/ws');
-ws.onmessage = (event) => {
-    const signal = JSON.parse(event.data);
-    console.log('New signal:', signal);
-};
-```
-
-## 🗄️ Database Schema
-
-### Key Tables
-- **`candle_cache`** - Historical market data (OHLCV)
-- **`smart_models`** - ML model weights (binary storage)
-- **`direction_predictions`** - Trading signals with outcomes
-- **`model_performance`** - Accuracy tracking
-- **`training_examples`** - ML training data
-
-### Query Examples
-```sql
--- Check latest signals
-SELECT symbol, prediction, confidence, created_at 
-FROM direction_predictions 
-ORDER BY created_at DESC LIMIT 10;
-
--- Model performance
-SELECT symbol, accuracy, prediction_count 
-FROM smart_models;
-
--- Market data summary
-SELECT symbol, COUNT(*) as candle_count 
-FROM candle_cache 
-GROUP BY symbol;
-```
-
-## 🛡️ Security Notes
-
-- Database credentials are in Docker network only
-- No external API keys exposed
-- WebSocket connections are local only
-- All data stored locally
-
-## 🔄 Updates & Maintenance
-
-### Update System
-```powershell
-# Pull latest code
-git pull origin main
-
-# Rebuild and restart
-docker-compose build
-docker-compose up -d
-```
-
-### Backup Data
-```powershell
-# Backup database
-docker-compose exec postgres pg_dump -U admin predpump > backup.sql
-
-# Backup volume data
-docker cp rus-connect-postgres-1:/var/lib/postgresql/data ./postgres-backup
-```
-
-### Clean Installation
-```powershell
-# Remove all containers and volumes
+### 4. Доступ к Веб-интерфейсу
+Откройте ваш браузер и перейдите по адресу: **[http://localhost:3000](http://localhost:3000)**.
+
+Вы должны увидеть главную панель управления. Данные начнут появляться по мере их сбора и обработки, что может занять несколько минут.
+
+## 🛠️ Управление и Мониторинг
+
+### Просмотр Логов
+Логоги — основной инструмент для отладки и мониторинга.
+
+- **Просмотр логов всех сервисов в реальном времени:**
+  ```bash
+  docker-compose logs -f
+  ```
+- **Просмотр логов конкретного сервиса (например, `analytics-engine`):**
+  ```bash
+  docker-compose logs -f analytics-engine
+  ```
+- **Поиск конкретной информации в логах (например, сгенерированных сигналов):**
+  ```bash
+  # Для PowerShell
+  docker-compose logs analytics-engine | findstr "HONEST SIGNAL"
+
+  # Для Linux/macOS
+  docker-compose logs analytics-engine | grep "HONEST SIGNAL"
+  ```
+
+### Пересборка и Перезапуск Сервисов
+Если вы внесли изменения в код одного из сервисов, его нужно пересобрать.
+
+- **Пересобрать и перезапустить конкретный сервис (например, `analytics-engine`):**
+  ```bash
+  docker-compose up --build -d --no-deps analytics-engine
+  ```
+- **Перезапустить все сервисы:**
+  ```bash
+  docker-compose restart
+  ```
+
+### Взаимодействие с Базой Данных
+Вы можете подключиться к базе данных PostgreSQL для выполнения прямых запросов.
+
+- **Подключиться к psql:**
+  ```bash
+  docker-compose exec postgres psql -U admin -d predpump
+  ```
+- **Примеры SQL-запросов:**
+  ```sql
+  -- Показать последние 10 сгенерированных сигналов
+  SELECT symbol, direction, confidence, created_at FROM direction_predictions ORDER BY created_at DESC LIMIT 10;
+
+  -- Посчитать количество свечей для каждого символа
+  SELECT symbol, COUNT(*) as candle_count FROM candle_cache GROUP BY symbol;
+
+  -- Посмотреть производительность моделей
+  SELECT * FROM model_performance ORDER BY created_at DESC LIMIT 5;
+  ```
+
+## ⚙️ API Эндпоинты
+
+API Gateway предоставляет несколько ключевых эндпоинтов для взаимодействия с системой.
+
+- `GET /api/v1/ml/metrics`
+  - **Описание**: Возвращает подробные метрики производительности всех ИИ-моделей, включая точность, уверенность и общее состояние системы.
+  - **Пример использования:** `curl http://localhost:8080/api/v1/ml/metrics`
+
+- `GET /api/v1/ml/calibration`
+  - **Описание**: Возвращает статус калибровки моделей в реальном времени.
+  - **Пример использования:** `curl http://localhost:8080/api/v1/ml/calibration`
+
+- `GET /api/v1/trader-mind/full/:symbol`
+  - **Описание**: Предоставляет комплексный анализ для указанного символа (`BTCUSDT`, `ETHUSDT` и т.д.), включая агрегированное решение, анализ по каждой модели и оценку риска.
+  - **Пример использования:** `curl http://localhost:8080/api/v1/trader-mind/full/BTCUSDT`
+
+## 🐛 Устранение Неполадок
+
+- **Проблема**: Сервисы не запускаются или сразу падают.
+  - **Решение**: Убедитесь, что Docker Desktop запущен. Выполните `docker-compose down -v` для полной остановки и удаления всех контейнеров и томов, а затем снова `docker-compose up --build -d`.
+
+- **Проблема**: В веб-интерфейсе нет данных.
+  - **Решение**: Проверьте логи `data-fetcher` и `analytics-engine`. Возможно, есть проблемы с подключением к API биржи или обработкой данных. Подождите 5-10 минут, так как системе нужно время для сбора начальных данных.
+  ```bash
+  docker-compose logs -f data-fetcher analytics-engine
+  ```
+
+- **Проблема**: Ошибки `502 Bad Gateway` в браузере.
+  - **Решение**: Это означает, что `api-gateway` не может связаться с `analytics-engine`. Проверьте логи `analytics-engine` на наличие ошибок. Убедитесь, что он находится в состоянии `healthy` с помощью `docker-compose ps`.
+
+- **Проблема**: Низкая уверенность сигналов.
+  - **Решение**: Это нормально на начальном этапе. Моделям требуется время для сбора данных и калибровки. Проверьте логи `analytics-engine` на сообщения о загрузке исторических данных.
+
+## 🔄 Полная Очистка
+
+Чтобы полностью удалить все данные, включая контейнеры, сети, тома (данные БД) и образы, выполните следующие команды:
+```bash
+# Остановить и удалить контейнеры, сети и тома
 docker-compose down -v
 
-# Remove images  
+# Удалить все образы, связанные с проектом
 docker-compose down --rmi all
-
-# Fresh start
-docker-compose up -d
 ```
 
-## 📈 Expected Results
+---
 
-After successful deployment, you should see:
-- **🎯 High-confidence signals** (65-80% confidence)
-- **🧠 Continuous learning** from market outcomes  
-- **📊 Real-time signal table** on frontend
-- **🗄️ Persistent storage** of all data
-- **⚡ Fast performance** with compact storage
-
-## 🤝 Support
-
-For issues or questions:
-1. Check logs: `docker-compose logs [service-name]`
-2. Verify configuration files
-3. Restart specific services
-4. Clean restart if needed
-
-The system is designed to be self-healing and will automatically:
-- Reconnect to data sources
-- Retrain models on poor performance
-- Persist data between restarts
-- Generate only honest, high-confidence signals
-
-**Happy Trading! 🚀**
+**Счастливого трейдинга! 🚀**

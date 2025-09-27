@@ -4,6 +4,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"math"
@@ -38,6 +39,9 @@ type EnsembleTradingAI struct {
 	mu          sync.RWMutex
 	IsTraining  map[string]bool
 	LastUpdated time.Time
+	// Persistence hooks (optional)
+	DB           *sql.DB
+	KafkaBrokers []string
 }
 
 // 🤖 LSTM Predictor - Specialized for temporal patterns
@@ -235,6 +239,12 @@ func NewEnsembleTradingAI() *EnsembleTradingAI {
 	return ensemble
 }
 
+// SetPersistence injects optional DB and Kafka brokers into the ensemble for publishing
+func (ensemble *EnsembleTradingAI) SetPersistence(db *sql.DB, brokers []string) {
+	ensemble.DB = db
+	ensemble.KafkaBrokers = brokers
+}
+
 // 🎯 Initialize Models for Symbol
 func (ensemble *EnsembleTradingAI) InitializeModels(symbol string) error {
 	ensemble.mu.Lock()
@@ -361,6 +371,49 @@ func (ensemble *EnsembleTradingAI) PredictHighAccuracy(symbol string, marketData
 	log.Printf("📊 Model Breakdown: LSTM=%.1f%% | XGBoost=%.1f%% | Transformer=%.1f%% | Risk=%s",
 		lstmPred.Confidence*100, xgboostPred.Confidence*100,
 		transformerPred.Confidence*100, riskAssessment.RiskLevel)
+
+	// Publish per-model analysis for observability (best-effort)
+	go func() {
+		// LSTM
+		payload := map[string]interface{}{
+			"symbol":     symbol,
+			"model_name": "LSTM",
+			"prediction": lstmPred.Prediction,
+			"confidence": lstmPred.Confidence,
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+		}
+		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+
+		// XGBoost
+		payload = map[string]interface{}{
+			"symbol":     symbol,
+			"model_name": "XGBoost",
+			"prediction": xgboostPred.Prediction,
+			"confidence": xgboostPred.Confidence,
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+		}
+		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+
+		// Transformer
+		payload = map[string]interface{}{
+			"symbol":     symbol,
+			"model_name": "Transformer",
+			"prediction": transformerPred.Prediction,
+			"confidence": transformerPred.Confidence,
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+		}
+		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+
+		// Ensemble final
+		payload = map[string]interface{}{
+			"symbol":     symbol,
+			"model_name": "ENSEMBLE",
+			"prediction": ensemblePred.Prediction,
+			"confidence": ensemblePred.Confidence,
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+		}
+		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+	}()
 
 	return result, nil
 }

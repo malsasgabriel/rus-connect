@@ -234,14 +234,63 @@ func (m *MLTradingModel) initializeDenseLayer(inputSize, outputSize int) [][]flo
 
 // Predict generates trading signal using the complete ML pipeline
 func (m *MLTradingModel) Predict(features [][]float64) *TradingSignal {
-	if len(features) < m.SequenceLength || len(features[0]) < m.FeatureCount {
-		log.Printf("❌ Insufficient data for prediction: need %d sequences with %d features each",
-			m.SequenceLength, m.FeatureCount)
+	// If features shorter than SequenceLength, pad at the beginning with zeros
+	seqLen := len(features)
+	if seqLen == 0 {
+		log.Printf("\u274c No feature data provided for prediction")
 		return nil
 	}
 
-	// Extract the last sequence_length samples
-	inputSequence := features[len(features)-m.SequenceLength:]
+	// Normalize feature width: if each timestep has fewer features than expected, pad with zeros
+	for i := range features {
+		if len(features[i]) < m.FeatureCount {
+			pad := make([]float64, m.FeatureCount-len(features[i]))
+			features[i] = append(features[i], pad...)
+		}
+	}
+
+	var inputSequence [][]float64
+	if seqLen >= m.SequenceLength {
+		inputSequence = features[seqLen-m.SequenceLength:]
+	} else {
+		// Need to pad with zero-rows at the beginning
+		padCount := m.SequenceLength - seqLen
+		inputSequence = make([][]float64, 0, m.SequenceLength)
+		// If we have at least two timesteps, linearly extrapolate backward from the first two points.
+		// Otherwise, duplicate the earliest available timestep.
+		if seqLen >= 2 {
+			f0 := features[0]
+			f1 := features[1]
+			// compute delta = f1 - f0
+			delta := make([]float64, m.FeatureCount)
+			for j := 0; j < m.FeatureCount; j++ {
+				delta[j] = f1[j] - f0[j]
+			}
+			// create pad rows from farthest to nearest to f0
+			for i := padCount; i >= 1; i-- {
+				factor := float64(i) / float64(padCount+1) // in (0,1)
+				row := make([]float64, m.FeatureCount)
+				for j := 0; j < m.FeatureCount; j++ {
+					row[j] = f0[j] - delta[j]*factor
+				}
+				inputSequence = append(inputSequence, row)
+			}
+		} else {
+			padRow := make([]float64, m.FeatureCount)
+			copy(padRow, features[0])
+			for i := 0; i < padCount; i++ {
+				rowCopy := make([]float64, len(padRow))
+				copy(rowCopy, padRow)
+				inputSequence = append(inputSequence, rowCopy)
+			}
+		}
+		// append actual features
+		for _, f := range features {
+			row := make([]float64, len(f))
+			copy(row, f)
+			inputSequence = append(inputSequence, row)
+		}
+	}
 
 	// Forward pass through LSTM + Attention
 	lstmOutput := m.forwardLSTM(inputSequence)

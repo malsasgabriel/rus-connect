@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"math"
@@ -21,6 +22,13 @@ type SelfLearningEngine struct {
 	FeatureImportance  map[string][]FeatureScore     `json:"feature_importance"`
 	mutex              sync.RWMutex                  `json:"-"`
 	isRunning          bool                          `json:"-"`
+	// Calibration maps and thresholds per-symbol
+	CalibrationBins  map[string][]float64 `json:"calibration_bins"`   // per-bin observed accuracy
+	CalibrationBinsN int                  `json:"calibration_bins_n"` // number of bins used
+	EmitThresholds   map[string]float64   `json:"emit_thresholds"`    // per-symbol emission threshold after calibration
+	CalMinSamples    int                  `json:"cal_min_samples"`    // minimum samples to compute calibration
+	DB               *sql.DB
+	KafkaBrokers     []string
 }
 
 // TrainingRequest represents a request for model training
@@ -141,9 +149,21 @@ func NewSelfLearningEngine() *SelfLearningEngine {
 			DriftThreshold: 0.1,
 			WindowSize:     100,
 		},
+		CalibrationBins:  make(map[string][]float64),
+		CalibrationBinsN: 10,
+		EmitThresholds:   make(map[string]float64),
+		CalMinSamples:    20,
+		DB:               nil,
+		KafkaBrokers:     []string{},
 	}
 
 	return engine
+}
+
+// SetPersistence injects DB and Kafka brokers for publishing model analyses
+func (sle *SelfLearningEngine) SetPersistence(db *sql.DB, brokers []string) {
+	sle.DB = db
+	sle.KafkaBrokers = brokers
 }
 
 // Start begins the self-learning engine
@@ -177,6 +197,20 @@ func (sle *SelfLearningEngine) PredictWithEnsemble(symbol string, features [][]f
 		return nil
 	}
 
+	// Ensure feature width matches model.FeatureCount
+	if len(features) > 0 && len(features[0]) != model.FeatureCount {
+		log.Printf("⚠️ Feature width mismatch for %s: got=%d expected=%d — padding/truncating", symbol, len(features[0]), model.FeatureCount)
+		// Adjust each timestep
+		for i := range features {
+			if len(features[i]) < model.FeatureCount {
+				pad := make([]float64, model.FeatureCount-len(features[i]))
+				features[i] = append(features[i], pad...)
+			} else if len(features[i]) > model.FeatureCount {
+				features[i] = features[i][:model.FeatureCount]
+			}
+		}
+	}
+
 	// Generate prediction
 	signal := model.Predict(features)
 	if signal == nil {
@@ -190,6 +224,24 @@ func (sle *SelfLearningEngine) PredictWithEnsemble(symbol string, features [][]f
 	// Apply ensemble weights
 	if weight, exists := sle.EnsembleWeights[symbol]; exists {
 		signal.Confidence *= weight
+	}
+
+	// Apply calibration if available (binning calibration)
+	calibrated := sle.applyCalibration(symbol, signal.Confidence)
+	if calibrated >= 0 {
+		// replace confidence with calibrated estimate
+		signal.Confidence = calibrated
+	}
+
+	// If calibrated confidence below per-symbol emit threshold, suppress signal
+	emitThreshold := 0.55 // default target: 55%
+	if t, ok := sle.EmitThresholds[symbol]; ok {
+		emitThreshold = t
+	}
+
+	if signal.Confidence < emitThreshold {
+		log.Printf("🚫 Suppressed signal for %s due to low calibrated confidence %.2f (threshold %.2f)", symbol, signal.Confidence, emitThreshold)
+		return nil
 	}
 
 	// Log prediction for future evaluation
@@ -213,6 +265,19 @@ func (sle *SelfLearningEngine) PredictWithEnsemble(symbol string, features [][]f
 		sle.PredictionLog[symbol] = sle.PredictionLog[symbol][len(sle.PredictionLog[symbol])-1000:]
 	}
 	sle.mutex.Unlock()
+
+	// publish per-model analysis (best-effort) if analytics engine is available via global DB
+	// Note: We don't have direct access to AnalyticsEngine here; publish to localhost:9092 by default
+	go func() {
+		payload := map[string]interface{}{
+			"symbol":     symbol,
+			"model_name": signal.ModelUsed,
+			"prediction": signal.Prediction,
+			"confidence": signal.Confidence,
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+		}
+		PublishModelAnalysisDBAndKafka(sle.DB, sle.KafkaBrokers, payload)
+	}()
 
 	return signal
 }
@@ -569,6 +634,52 @@ func (sle *SelfLearningEngine) performSmartCalibration() {
 					if pred.IsCorrect {
 						predAcc = 1.0
 					}
+
+					// ---- Calibration: build bins of confidence -> observed accuracy
+					// Only if we have enough recent predictions
+					if len(recentPredictions) >= sle.CalMinSamples {
+						n := sle.CalibrationBinsN
+						// initialize counters
+						counts := make([]int, n)
+						corrects := make([]int, n)
+
+						for _, pred := range recentPredictions {
+							idx := int(pred.Confidence * float64(n))
+							if idx < 0 {
+								idx = 0
+							}
+							if idx >= n {
+								idx = n - 1
+							}
+							counts[idx]++
+							if pred.IsCorrect {
+								corrects[idx]++
+							}
+						}
+
+						bins := make([]float64, n)
+						for i := 0; i < n; i++ {
+							if counts[i] > 0 {
+								bins[i] = float64(corrects[i]) / float64(counts[i])
+							} else {
+								bins[i] = 0.0
+							}
+						}
+
+						sle.CalibrationBins[symbol] = bins
+
+						// Determine minimal emit threshold where bin accuracy >= target (0.55)
+						targetAcc := 0.55
+						thr := 0.55
+						for i := 0; i < n; i++ {
+							if bins[i] >= targetAcc {
+								thr = float64(i) / float64(n)
+								break
+							}
+						}
+						sle.EmitThresholds[symbol] = thr
+						log.Printf("🔧 Calibration updated for %s: emit_threshold=%.2f", symbol, thr)
+					}
 					variance += (predAcc - mean) * (predAcc - mean)
 				}
 				variance /= 20
@@ -593,6 +704,44 @@ func (sle *SelfLearningEngine) performSmartCalibration() {
 		log.Println("🚨 System performance below threshold - triggering global optimization")
 		sle.triggerGlobalOptimization()
 	}
+}
+
+// applyCalibration applies simple bin-based calibration to raw confidences.
+// Returns calibrated confidence in [0,1], or -1 if not enough data.
+func (sle *SelfLearningEngine) applyCalibration(symbol string, rawConf float64) float64 {
+	sle.mutex.RLock()
+	bins, exists := sle.CalibrationBins[symbol]
+	n := sle.CalibrationBinsN
+	sle.mutex.RUnlock()
+
+	if !exists || len(bins) != n {
+		return -1
+	}
+
+	// Map rawConf [0,1] to bin index
+	idx := int(rawConf * float64(n))
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+
+	// bins hold observed accuracy per bin (0..1)
+	cal := bins[idx]
+	if cal <= 0 {
+		return -1
+	}
+
+	// Simple calibrated probability: weighted average between raw confidence and bin accuracy
+	calibrated := 0.5*rawConf + 0.5*cal
+	if calibrated < 0 {
+		calibrated = 0
+	}
+	if calibrated > 1 {
+		calibrated = 1
+	}
+	return calibrated
 }
 
 // triggerEmergencyRetraining performs emergency model retraining

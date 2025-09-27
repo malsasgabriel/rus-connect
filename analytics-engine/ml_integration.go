@@ -148,6 +148,17 @@ func (mli *MLAnalyticsIntegration) emitMLSignal(symbol string, signal *TradingSi
 
 	log.Printf("🎯 ML Signal emitted: %s %s (%.1f%% confidence)",
 		symbol, signal.Prediction, signal.Confidence*100)
+
+	// also publish per-model analysis
+	payload := map[string]interface{}{
+		"symbol":       symbol,
+		"model_name":   "LSTM",
+		"prediction":   signal.Prediction,
+		"confidence":   signal.Confidence,
+		"price_target": signal.PriceTarget,
+		"timestamp":    time.Now().UTC().Format(time.RFC3339),
+	}
+	go PublishModelAnalysisDBAndKafka(mli.analyticsEngine.db, mli.analyticsEngine.kafkaBrokers, payload)
 }
 
 // 🔄 Convert ML Prediction to Direction

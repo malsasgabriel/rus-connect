@@ -1,0 +1,81 @@
+{
+  "Summary": {
+    "TotalReturn": -0.07859564402904652,
+    "SharpeRatio": -0.5277926217161666,
+    "MaxDrawdown": 0.07859564402904652,
+    "WinRate": 0,
+    "ProfitFactor": 0,
+    "TotalTrades": 6
+  },
+  "Charts": {
+    "EquityCurve": [
+      {
+        "Timestamp": 1757916000,
+        "Value": 10000
+      },
+      {
+        "Timestamp": 1757926800,
+        "Value": 10000
+      },
+      {
+        "Timestamp": 1758117600,
+        "Value": 9999.8
+      },
+      {
+        "Timestamp": 1758196800,
+        "Value": 9999.600004
+      },
+      {
+        "Timestamp": 1758265200,
+        "Value": 9999.400004
+      },
+      {
+        "Timestamp": 1758330000,
+        "Value": 9999.400004
+      },
+      {
+        "Timestamp": 1758412800,
+        "Value": 9992.540415597256
+      },
+      {
+        "Timestamp": 1758412800,
+        "Value": 9992.340423597176
+      },
+      {
+        "Timestamp": 1758412800,
+        "Value": 9992.140435597095
+      }
+    ],
+    "DrawdownChart": null,
+    "MonthlyReturns": {}
+  },
+  "Analysis": {
+    "TradeDuration": {
+      "Mean": 2960,
+      "StdDev": 1482.5653442597395,
+      "Min": 1320,
+      "Max": 5640,
+      "Median": 2910
+    },
+    "PnLDistribution": {
+      "Mean": -1.3099274004840014,
+      "StdDev": 2.4818838506302505,
+      "Min": -6.8595884027440075,
+      "Max": -0.19998800007999998,
+      "Median": -0.199998
+    },
+    "TimeAnalysis": {
+      "day_Friday": -0.19998800007999998,
+      "day_Monday": -0.2,
+      "day_Saturday": -6.8595884027440075,
+      "day_Thursday": -0.19999200008,
+      "day_Wednesday": -0.199996,
+      "hour_01": -6.8595884027440075,
+      "hour_06": -0.2,
+      "hour_07": -0.19998800007999998,
+      "hour_09": -0.2,
+      "hour_12": -0.19999200008,
+      "hour_14": -0.199996
+    }
+  }
+}

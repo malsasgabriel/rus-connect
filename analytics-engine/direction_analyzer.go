@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"strings"
+
 	_ "github.com/lib/pq"
 	"github.com/segmentio/kafka-go"
 )
@@ -75,6 +77,7 @@ type DirectionAnalyzer struct {
 	historyMutex  sync.RWMutex
 	predictor     *DirectionML
 	kafkaProducer *kafka.Writer
+	kafkaBrokers  []string
 }
 
 // DirectionML contains the ML model for direction prediction
@@ -113,9 +116,15 @@ func NewDirectionAnalyzer(db *sql.DB, kafkaBrokers string) *DirectionAnalyzer {
 	// Initialize database tables
 	initDirectionTables(db)
 
+	// support comma-separated list of brokers
+	brokerList := []string{kafkaBrokers}
+	if strings.Contains(kafkaBrokers, ",") {
+		brokerList = strings.Split(kafkaBrokers, ",")
+	}
+
 	// Kafka producer for predictions
 	producer := &kafka.Writer{
-		Addr:     kafka.TCP(kafkaBrokers),
+		Addr:     kafka.TCP(brokerList...),
 		Topic:    "direction_signals", // Use same topic as main analytics engine
 		Balancer: &kafka.LeastBytes{},
 	}
@@ -125,6 +134,7 @@ func NewDirectionAnalyzer(db *sql.DB, kafkaBrokers string) *DirectionAnalyzer {
 		candleHistory: make(map[string][]Candle),
 		predictor:     NewDirectionML(),
 		kafkaProducer: producer,
+		kafkaBrokers:  brokerList,
 	}
 }
 
@@ -457,9 +467,25 @@ func (da *DirectionAnalyzer) savePrediction(prediction DirectionPrediction) {
 }
 
 func (da *DirectionAnalyzer) publishPrediction(prediction DirectionPrediction) {
-	data, err := json.Marshal(prediction)
+	// Build a tolerant payload compatible with DirectionSignal consumers
+	payload := map[string]interface{}{
+		"symbol":        prediction.Symbol,
+		"timestamp":     prediction.Timestamp.Format(time.RFC3339),
+		"direction":     prediction.Direction,
+		"confidence":    prediction.Confidence,
+		"price_target":  prediction.PriceTarget,
+		"current_price": prediction.CurrentPrice,
+		"time_horizon":  prediction.TimeHorizon,
+		"features":      prediction.Features,
+		// Provide model identifiers so downstream consumers (api-gateway, frontend)
+		// can display which model produced the signal. Mark these as traditional.
+		"model_type": "TRADITIONAL",
+		"model_used": "DirectionAnalyzer",
+	}
+
+	data, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("Failed to marshal prediction: %v", err)
+		log.Printf("Failed to marshal prediction payload: %v", err)
 		return
 	}
 
@@ -471,6 +497,18 @@ func (da *DirectionAnalyzer) publishPrediction(prediction DirectionPrediction) {
 
 	if err != nil {
 		log.Printf("Failed to publish prediction: %v", err)
+	} else {
+		log.Printf("📡 Published prediction to Kafka: %s %s (%.2f%%)", prediction.Symbol, prediction.Direction, prediction.Confidence*100)
+		// also publish per-model analysis to model_analyses topic and DB
+		payload := map[string]interface{}{
+			"symbol":     prediction.Symbol,
+			"model_name": "DirectionAnalyzer",
+			"prediction": prediction.Direction,
+			"confidence": prediction.Confidence,
+			"timestamp":  prediction.CreatedAt.Format(time.RFC3339),
+			"features":   prediction.Features,
+		}
+		go PublishModelAnalysisDBAndKafka(da.db, da.kafkaBrokers, payload)
 	}
 }
 

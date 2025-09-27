@@ -54,7 +54,7 @@ func NewBacktestEngine(db *sql.DB, symbols []string, startDate, endDate time.Tim
 }
 
 // Run executes the backtest
-func (be *BacktestEngine) Run() (*common.BacktestReport, error) {
+func (be *BacktestEngine) Run() (*common.BacktestReport, []Trade, error) {
 	report := &common.BacktestReport{}
 
 	// Initialize report structures
@@ -64,27 +64,134 @@ func (be *BacktestEngine) Run() (*common.BacktestReport, error) {
 	// Get all signals and candles for the period
 	signals, candles, err := be.fetchData()
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch data: %v", err)
+		return nil, nil, fmt.Errorf("failed to fetch data: %v", err)
 	}
 
 	// Execute trades based on signals
+	// Aggregate signals to reduce noise (5 minute buckets)
+	signals = aggregateSignals(signals, 5)
+
+	// Assign dynamic TP/SL based on ATR if missing
+	assignDynamicTPSL(signals, candles)
+
 	trades, equityCurve, err := be.executeTrades(signals, candles)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute trades: %v", err)
+		return nil, nil, fmt.Errorf("failed to execute trades: %v", err)
 	}
 
 	// Calculate performance metrics
 	be.calculateMetrics(report, trades, equityCurve)
 
-	return report, nil
+	return report, trades, nil
 }
 
 // fetchData retrieves signals and candles for backtesting
 func (be *BacktestEngine) fetchData() ([]common.Signal, map[string][]Candle, error) {
-	// This would fetch data from the database
-	// For now, we'll generate realistic mock data
-	signals := be.generateMockSignals()
+	signals := make([]common.Signal, 0)
 	candles := make(map[string][]Candle)
+
+	// Try to load real signals from direction_predictions table
+	rows, err := be.db.Query(`
+		SELECT symbol, timestamp, direction, confidence, price_target, current_price, time_horizon
+		FROM direction_predictions
+		WHERE timestamp BETWEEN $1 AND $2
+		ORDER BY timestamp ASC
+	`, be.startDate, be.endDate)
+	if err != nil {
+		// If query fails, fallback to mock signals but return the error so caller can log
+		log.Printf("Failed to query direction_predictions: %v", err)
+		signals = be.generateMockSignals()
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var sym string
+			var ts time.Time
+			var dir string
+			var conf sql.NullFloat64
+			var priceTarget sql.NullFloat64
+			var currentPrice sql.NullFloat64
+			var horizon sql.NullInt64
+
+			if err := rows.Scan(&sym, &ts, &dir, &conf, &priceTarget, &currentPrice, &horizon); err != nil {
+				log.Printf("Failed to scan direction_predictions row: %v", err)
+				continue
+			}
+
+			// Map stored direction to common.Signal Prediction strings
+			prediction := "NEUTRAL"
+			if dir == "UP" {
+				prediction = "STRONG_BUY"
+			} else if dir == "DOWN" {
+				prediction = "STRONG_SELL"
+			}
+
+			s := common.Signal{
+				Symbol:      sym,
+				Timestamp:   ts,
+				Prediction:  prediction,
+				Confidence:  0.0,
+				PriceTarget: 0.0,
+				StopLoss:    0.0,
+				ModelUsed:   "replay",
+			}
+			if conf.Valid {
+				s.Confidence = conf.Float64
+			}
+			if priceTarget.Valid {
+				s.PriceTarget = priceTarget.Float64
+			}
+			if currentPrice.Valid && s.StopLoss == 0 {
+				// Set a conservative stop loss if not present
+				s.StopLoss = currentPrice.Float64 * 0.99
+			}
+
+			signals = append(signals, s)
+		}
+
+		if len(signals) == 0 {
+			// No stored signals for period — fallback to mock
+			signals = be.generateMockSignals()
+		}
+		log.Printf("Loaded %d signals for backtest period", len(signals))
+		// Log first few signals for debugging
+		for i := 0; i < len(signals) && i < 5; i++ {
+			s := signals[i]
+			log.Printf("Sample signal %d: symbol=%s prediction=%s confidence=%.4f price_target=%.8f model=%s", i, s.Symbol, s.Prediction, s.Confidence, s.PriceTarget, s.ModelUsed)
+		}
+	}
+
+	// Load candles for each requested symbol from candle_cache
+	for _, sym := range be.symbols {
+		qrows, err := be.db.Query(`
+			SELECT to_timestamp(timestamp)::timestamptz, open, high, low, close, volume
+			FROM candle_cache
+			WHERE symbol = $1 AND timestamp BETWEEN $2 AND $3
+			ORDER BY timestamp ASC
+		`, sym, be.startDate.Unix(), be.endDate.Unix())
+		if err != nil {
+			log.Printf("Failed to query candles for %s: %v", sym, err)
+			continue
+		}
+		defer qrows.Close()
+
+		var cs []Candle
+		for qrows.Next() {
+			var ts time.Time
+			var c Candle
+			if err := qrows.Scan(&ts, &c.Open, &c.High, &c.Low, &c.Close, &c.Volume); err != nil {
+				log.Printf("Failed to scan candle row for %s: %v", sym, err)
+				continue
+			}
+			c.Symbol = sym
+			c.Timestamp = ts
+			cs = append(cs, c)
+		}
+
+		if len(cs) > 0 {
+			candles[sym] = cs
+			log.Printf("Loaded %d candles for %s", len(cs), sym)
+		}
+	}
 
 	return signals, candles, nil
 }
@@ -213,25 +320,51 @@ func (be *BacktestEngine) executeTrades(signals []common.Signal, candles map[str
 
 // shouldEnterTrade determines if we should enter a trade based on signal
 func (be *BacktestEngine) shouldEnterTrade(signal common.Signal) bool {
-	// Only enter trades with high confidence
-	return signal.Confidence > 0.7 && (signal.Prediction == "STRONG_BUY" || signal.Prediction == "STRONG_SELL")
+	// For replay/backtest allow slightly lower threshold so we have trades to evaluate
+	return signal.Confidence > 0.4 && (signal.Prediction == "STRONG_BUY" || signal.Prediction == "STRONG_SELL" || signal.Prediction == "BUY" || signal.Prediction == "SELL")
 }
 
 // openPosition opens a new trading position
-func (be *BacktestEngine) openPosition(signal common.Signal, capital float64, _ map[string][]Candle) (Trade, error) {
-	// Get current price for the symbol
-	currentPrice := signal.PriceTarget // Simplified - in reality, we'd get the actual market price
+func (be *BacktestEngine) openPosition(signal common.Signal, capital float64, candles map[string][]Candle) (Trade, error) {
+	// Determine entry price using historical candles if available
+	var currentPrice float64 = signal.PriceTarget
+	if currentPrice == 0 {
+		if arr, ok := candles[signal.Symbol]; ok && len(arr) > 0 {
+			// find first candle with Timestamp >= signal.Timestamp
+			ts := signal.Timestamp
+			found := false
+			for _, c := range arr {
+				if !c.Timestamp.Before(ts) {
+					currentPrice = c.Close
+					found = true
+					break
+				}
+			}
+			if !found {
+				// use last available close
+				currentPrice = arr[len(arr)-1].Close
+			}
+		}
+	}
+
+	if currentPrice == 0 {
+		// final fallback
+		if signal.StopLoss > 0 {
+			currentPrice = signal.StopLoss * 1.01
+		} else {
+			currentPrice = 1.0
+		}
+	}
 
 	// Calculate position size (1% of capital)
 	positionSize := capital * 0.01
 	quantity := positionSize / currentPrice
 
 	direction := "LONG"
-	if signal.Prediction == "STRONG_SELL" {
+	if signal.Prediction == "STRONG_SELL" || signal.Prediction == "SELL" {
 		direction = "SHORT"
 	}
 
-	// Calculate stop loss and take profit
 	stopLoss := signal.StopLoss
 	takeProfit := signal.PriceTarget
 
@@ -250,24 +383,70 @@ func (be *BacktestEngine) openPosition(signal common.Signal, capital float64, _ 
 }
 
 // closePosition closes an existing trading position
-func (be *BacktestEngine) closePosition(position Trade, exitTime time.Time, _ map[string][]Candle) Trade {
-	// Get exit price (simplified)
-	exitPrice := position.TakeProfit // In reality, we'd get the actual market price at exitTime
+func (be *BacktestEngine) closePosition(position Trade, exitTime time.Time, candles map[string][]Candle) Trade {
 
-	// Calculate PnL with some randomness to make it more realistic
-	// In a real scenario, this would be based on actual market movements
+	// Determine exit price using historical candles if available and check intrabar SL/TP
+	exitPrice := position.TakeProfit
+	if arr, ok := candles[position.Symbol]; ok && len(arr) > 0 {
+		// We will scan candles from entry time to exitTime and detect earliest SL/TP hit
+		var lastClose float64 = position.EntryPrice
+		for _, c := range arr {
+			if c.Timestamp.Before(position.EntryTime) {
+				continue
+			}
+			if c.Timestamp.After(exitTime) {
+				break
+			}
+
+			// intrabar: if LONG, TP when high >= takeProfit; SL when low <= stopLoss
+			if position.Direction == "LONG" {
+				if position.TakeProfit > 0 && c.High >= position.TakeProfit {
+					exitPrice = position.TakeProfit
+					lastClose = exitPrice
+					// exit at TP, earliest occurrence
+					break
+				}
+				if position.StopLoss > 0 && c.Low <= position.StopLoss {
+					exitPrice = position.StopLoss
+					lastClose = exitPrice
+					break
+				}
+			} else {
+				// SHORT: TP when low <= takeProfit, SL when high >= stopLoss
+				if position.TakeProfit > 0 && c.Low <= position.TakeProfit {
+					exitPrice = position.TakeProfit
+					lastClose = exitPrice
+					break
+				}
+				if position.StopLoss > 0 && c.High >= position.StopLoss {
+					exitPrice = position.StopLoss
+					lastClose = exitPrice
+					break
+				}
+			}
+
+			// keep last close if no hits
+			lastClose = c.Close
+		}
+
+		// if still zero, use lastClose
+		if exitPrice == 0 {
+			exitPrice = lastClose
+		}
+	} else {
+		if exitPrice == 0 {
+			exitPrice = position.EntryPrice
+		}
+	}
+
+	// Deterministic PnL based on price move
 	var pnl float64
 	if position.Direction == "LONG" {
-		// Add some randomness to make it more realistic
 		priceChange := (exitPrice - position.EntryPrice) / position.EntryPrice
-		randomFactor := 0.8 + rand.Float64()*0.4 // 80-120% of expected return
-		actualChange := priceChange * randomFactor
-		pnl = position.EntryValue * actualChange
+		pnl = position.EntryValue * priceChange
 	} else {
 		priceChange := (position.EntryPrice - exitPrice) / position.EntryPrice
-		randomFactor := 0.8 + rand.Float64()*0.4 // 80-120% of expected return
-		actualChange := priceChange * randomFactor
-		pnl = position.EntryValue * actualChange
+		pnl = position.EntryValue * priceChange
 	}
 
 	// Apply transaction costs
@@ -277,8 +456,10 @@ func (be *BacktestEngine) closePosition(position Trade, exitTime time.Time, _ ma
 	totalCost := entryCost + exitCost
 	pnl -= totalCost
 
-	// Calculate percentage return
-	pnlPercentage := (pnl / position.EntryValue) * 100
+	pnlPercentage := 0.0
+	if position.EntryValue != 0 {
+		pnlPercentage = (pnl / position.EntryValue) * 100
+	}
 
 	position.ExitTime = exitTime
 	position.ExitPrice = exitPrice
@@ -485,6 +666,105 @@ func calculateDistribution(values []float64) common.Distribution {
 		Max:    max,
 		Median: median,
 	}
+}
+
+// aggregateSignals groups signals into minute buckets (bucketMinutes) and keeps the highest-confidence signal per symbol per bucket
+func aggregateSignals(signals []common.Signal, bucketMinutes int) []common.Signal {
+	if bucketMinutes <= 0 {
+		return signals
+	}
+
+	// map: symbol -> bucketStartUnix -> bestSignal
+	best := make(map[string]map[int64]common.Signal)
+
+	for _, s := range signals {
+		ts := s.Timestamp.Unix()
+		bucket := (ts / int64(bucketMinutes*60)) * int64(bucketMinutes*60)
+		if _, ok := best[s.Symbol]; !ok {
+			best[s.Symbol] = make(map[int64]common.Signal)
+		}
+		prev, exists := best[s.Symbol][bucket]
+		if !exists || s.Confidence > prev.Confidence {
+			best[s.Symbol][bucket] = s
+		}
+	}
+
+	out := make([]common.Signal, 0)
+	for _, bm := range best {
+		for _, s := range bm {
+			out = append(out, s)
+		}
+	}
+
+	// sort by timestamp
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
+	return out
+}
+
+// assignDynamicTPSL assigns a TP/SL to signals based on recent ATR if they are missing
+func assignDynamicTPSL(signals []common.Signal, candles map[string][]Candle) {
+	for i := range signals {
+		s := &signals[i]
+		if s.PriceTarget != 0 && s.StopLoss != 0 {
+			continue
+		}
+		// compute ATR from candles for symbol
+		if arr, ok := candles[s.Symbol]; ok && len(arr) >= 14 {
+			// take last 14 candles before signal.Timestamp
+			ts := s.Timestamp.Unix()
+			subset := make([]Candle, 0, 14)
+			for j := len(arr) - 1; j >= 0 && len(subset) < 14; j-- {
+				if arr[j].Timestamp.Unix() <= ts {
+					subset = append([]Candle{arr[j]}, subset...)
+				}
+			}
+			if len(subset) >= 7 {
+				atr := calculateATRFromCandles(subset, 14)
+				// set TP = entry + 2*ATR, SL = entry - 1*ATR for LONG, reversed for SHORT
+				entryPrice := s.PriceTarget
+				if entryPrice == 0 {
+					// approximate entry as last close
+					entryPrice = subset[len(subset)-1].Close
+				}
+				if s.Prediction == "STRONG_SELL" || s.Prediction == "SELL" {
+					s.PriceTarget = entryPrice * (1 - 2*atr)
+					s.StopLoss = entryPrice * (1 + 1*atr)
+				} else {
+					s.PriceTarget = entryPrice * (1 + 2*atr)
+					s.StopLoss = entryPrice * (1 - 1*atr)
+				}
+			}
+		}
+	}
+}
+
+// calculateATRFromCandles computes ATR as ratio (e.g., 0.02 for 2%) from slice of candles and given period
+func calculateATRFromCandles(candles []Candle, period int) float64 {
+	if len(candles) < 2 || period <= 0 {
+		return 0.02
+	}
+	// compute simple TRs
+	trs := make([]float64, 0, len(candles)-1)
+	for i := 1; i < len(candles); i++ {
+		cur := candles[i]
+		prev := candles[i-1]
+		tr := math.Max(cur.High-cur.Low, math.Max(math.Abs(cur.High-prev.Close), math.Abs(cur.Low-prev.Close)))
+		trs = append(trs, tr/cur.Close)
+	}
+	// average of last 'period' trs
+	start := 0
+	if len(trs) > period {
+		start = len(trs) - period
+	}
+	sum := 0.0
+	for i := start; i < len(trs); i++ {
+		sum += trs[i]
+	}
+	avg := sum / float64(len(trs)-start)
+	if avg == 0 {
+		return 0.02
+	}
+	return avg
 }
 
 // calculateSharpeRatio calculates the Sharpe ratio

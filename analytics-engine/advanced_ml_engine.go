@@ -20,6 +20,10 @@ type AdvancedMLEngine struct {
 	confidenceThreshold float64
 	minAccuracy         float64
 	adaptiveLearning    bool
+	// Calibration data loaded from DB
+	CalibrationBins  map[string][]float64
+	CalibrationBinsN int
+	EmitThresholds   map[string]float64
 }
 
 // SmartModel - компактная оптимизированная модель
@@ -60,6 +64,9 @@ func NewAdvancedMLEngine(db *sql.DB) *AdvancedMLEngine {
 		confidenceThreshold: 0.65, // Требуем минимум 65% уверенности
 		minAccuracy:         0.55, // Минимальная точность 55%
 		adaptiveLearning:    true,
+		CalibrationBins:     make(map[string][]float64),
+		CalibrationBinsN:    10,
+		EmitThresholds:      make(map[string]float64),
 	}
 
 	// Инициализируем таблицы
@@ -67,6 +74,9 @@ func NewAdvancedMLEngine(db *sql.DB) *AdvancedMLEngine {
 
 	// Загружаем сохраненные модели
 	engine.loadModels()
+
+	// Load calibration table if exists
+	engine.loadCalibration()
 
 	log.Println("🧠 Advanced ML Engine initialized with high-performance models")
 	return engine
@@ -110,7 +120,71 @@ func (engine *AdvancedMLEngine) initializeTables() {
 	engine.db.Exec(`CREATE INDEX IF NOT EXISTS idx_training_symbol_time ON training_examples (symbol, created_at DESC);`)
 	engine.db.Exec(`CREATE INDEX IF NOT EXISTS idx_training_verified ON training_examples (verified, created_at DESC);`)
 
+	// Calibration table
+	engine.db.Exec(`
+		CREATE TABLE IF NOT EXISTS model_calibration (
+			symbol VARCHAR(20) PRIMARY KEY,
+			bins JSONB,
+			emit_threshold DOUBLE PRECISION,
+			updated_at TIMESTAMPTZ DEFAULT NOW()
+		)
+	`)
+
 	log.Println("📊 Smart ML tables initialized")
+}
+
+// loadCalibration loads calibration bins and thresholds from DB
+func (engine *AdvancedMLEngine) loadCalibration() {
+	rows, err := engine.db.Query(`SELECT symbol, bins, emit_threshold FROM model_calibration`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var symbol string
+		var binsData []byte
+		var thr float64
+		if err := rows.Scan(&symbol, &binsData, &thr); err != nil {
+			continue
+		}
+		var bins []float64
+		if err := json.Unmarshal(binsData, &bins); err != nil {
+			continue
+		}
+		engine.CalibrationBins[symbol] = bins
+		engine.EmitThresholds[symbol] = thr
+		log.Printf("🔧 Loaded calibration for %s: threshold=%.2f", symbol, thr)
+	}
+}
+
+// applyCalibration applies bin-based calibration to raw confidence and returns calibrated value or -1 if not available
+func (engine *AdvancedMLEngine) applyCalibration(symbol string, raw float64) float64 {
+	bins, ok := engine.CalibrationBins[symbol]
+	n := engine.CalibrationBinsN
+	if !ok || len(bins) != n {
+		return -1
+	}
+	idx := int(raw * float64(n))
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	binAcc := bins[idx]
+	if binAcc <= 0 {
+		return -1
+	}
+	// simple blend
+	cal := 0.5*raw + 0.5*binAcc
+	if cal < 0 {
+		cal = 0
+	}
+	if cal > 1 {
+		cal = 1
+	}
+	return cal
 }
 
 // InitializeModel создает и инициализирует модель для символа
@@ -210,9 +284,21 @@ func (engine *AdvancedMLEngine) GenerateSmartPrediction(symbol string, candles [
 	// Вычисляем честную уверенность
 	confidence := engine.calculateHonestConfidence(model, features, prediction)
 
-	// Проверяем качество прогноза
-	if confidence < engine.confidenceThreshold {
-		log.Printf("⚠️ %s: Low confidence %.2f%%, skipping prediction", symbol, confidence*100)
+	// Применим калибровку, если она доступна
+	cal := engine.applyCalibration(symbol, confidence)
+	if cal >= 0 {
+		confidence = cal
+	}
+
+	// Вычислим порог эмиссии: сначала попробуем значение из таблицы, иначе используем confidenceThreshold
+	emitThr := engine.confidenceThreshold
+	if t, ok := engine.EmitThresholds[symbol]; ok && t > 0 {
+		emitThr = t
+	}
+
+	// Проверяем качество прогноза против порога
+	if confidence < emitThr {
+		log.Printf("⚠️ %s: Low calibrated confidence %.2f%% < threshold %.2f%%, skipping", symbol, confidence*100, emitThr*100)
 		return nil
 	}
 
@@ -228,6 +314,16 @@ func (engine *AdvancedMLEngine) GenerateSmartPrediction(symbol string, candles [
 
 	log.Printf("🎯 %s: HONEST prediction %s with %.1f%% confidence",
 		symbol, signal.Prediction, confidence*100)
+
+	// publish per-model analysis for AdvancedMLEngine
+	payload := map[string]interface{}{
+		"symbol":     symbol,
+		"model_name": "AdvancedMLEngine",
+		"prediction": signal.Prediction,
+		"confidence": signal.Confidence,
+		"timestamp":  time.Now().UTC().Format(time.RFC3339),
+	}
+	go PublishModelAnalysisDBAndKafka(engine.db, []string{"kafka:9092"}, payload)
 
 	return signal
 }

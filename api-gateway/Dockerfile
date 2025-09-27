@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine
+FROM golang:1.23-alpine
 
 RUN apk add --no-cache git
 
@@ -9,5 +9,3 @@ COPY . .
 RUN go build -o /bin/api-gateway ./...
 
 CMD ["/bin/api-gateway"]
-
-

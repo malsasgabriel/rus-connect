@@ -20,6 +20,7 @@ services:
     environment:
       - KAFKA_BROKERS=kafka:9092
       - PG_DSN=host=postgres user=admin password=password dbname=predpump sslmode=disable
+      - ANALYTICS_ENGINE_PORT=8081
     depends_on:
       kafka:
         condition: service_healthy
@@ -27,6 +28,14 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/api/v1/ml/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
   api-gateway:
     build: ./api-gateway
     networks:
@@ -35,12 +44,15 @@ services:
       - "8080:8080"
     environment:
       - KAFKA_BROKERS=kafka:9092
+      - ANALYTICS_ENGINE_URL=http://analytics-engine:8081
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      analytics-engine:
         condition: service_healthy
   frontend:
     build: ./frontend
@@ -50,22 +62,6 @@ services:
       - "3000:3000"
     depends_on:
       - api-gateway
-  autotrade:
-    build:
-      context: .
-      dockerfile: Dockerfile.autotrade
-    networks:
-      - predpump-network
-    environment:
-      - PG_DSN=host=postgres user=admin password=password dbname=predpump sslmode=disable
-      - BYBIT_API_KEY=${BYBIT_API_KEY}
-      - BYBIT_API_SECRET=${BYBIT_API_SECRET}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      analytics-engine:
-        condition: service_started
-    command: ["./autotrade", "--mode=demo", "--symbols=BTCUSDT,ETHUSDT", "--capital=1000", "--risk=medium"]
   postgres:
     image: postgres:15
     networks:

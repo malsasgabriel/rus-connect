@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { fetchWithFallback } from '../utils/api';
 
 interface LearningMetrics {
   accuracy: number;
@@ -37,20 +38,12 @@ export const LearningDashboard: React.FC = () => {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [metricsRes, statsRes] = await Promise.all([
-          fetch('/api/v1/admin/performance'),
-          fetch('/api/v1/admin/model-stats')
+        const [metricsData, statsData] = await Promise.all([
+          fetchWithFallback('/api/v1/admin/performance'),
+          fetchWithFallback('/api/v1/admin/model-stats')
         ]);
-        
-        if (metricsRes.ok) {
-          const metricsData = await metricsRes.json();
-          setMetrics(metricsData);
-        }
-        
-        if (statsRes.ok) {
-          const statsData = await statsRes.json();
-          setStats(statsData);
-        }
+        setMetrics(metricsData);
+        setStats(statsData);
       } catch (error) {
         console.error('Failed to fetch learning data:', error);
       }
@@ -66,7 +59,7 @@ export const LearningDashboard: React.FC = () => {
     e.preventDefault();
     
     try {
-      const response = await fetch('/api/v1/admin/feedback', {
+      const response = await fetchWithFallback('/api/v1/admin/feedback', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
