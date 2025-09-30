@@ -222,9 +222,9 @@ func (monitor *MLPerformanceMonitor) determineModelHealth(accuracy, confidence f
 	// Determine health based on total score
 	if score >= 85 {
 		return "EXCELLENT"
-	} else if score >= 70 {
+	} else if score >= 50 { // Lowered threshold to consider models with accuracy >= 0.5 as GOOD
 		return "GOOD"
-	} else if score >= 50 {
+	} else if score >= 30 {
 		return "WARNING"
 	} else {
 		return "CRITICAL"

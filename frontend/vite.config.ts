@@ -1,4 +1,3 @@
-
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -13,9 +12,16 @@ export default defineConfig({
     },
     proxy: {
       '/api': {
-        target: 'http://api-gateway:8080',
+        target: 'http://localhost:8080',
         changeOrigin: true,
         secure: false,
+      },
+      // Add proxy for WebSocket connections
+      '/ws': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+        secure: false,
+        ws: true, // Enable WebSocket proxying
       },
     },
   },

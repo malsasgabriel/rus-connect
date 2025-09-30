@@ -130,6 +130,8 @@ func main() {
 	r.GET("/api/v1/ml/metrics", getMLMetrics)
 	r.GET("/api/v1/ml/calibration", getCalibrationStatus)
 	r.POST("/api/v1/ml/calibration/start", startAutoCalibration)
+	// Infrastructure monitoring endpoint
+	r.GET("/api/v1/infrastructure/metrics", getInfrastructureMetrics)
 
 	// Proxy trader-mind endpoints to analytics-engine
 	r.GET("/api/v1/trader-mind/:symbol", proxyTraderMind)
@@ -501,6 +503,34 @@ func submitFeedback(c *gin.Context) {
 	})
 }
 
+// getMockInfrastructureMetrics returns mock infrastructure metrics for fallback
+func getMockInfrastructureMetrics() map[string]interface{} {
+	return map[string]interface{}{
+		"cpu": map[string]interface{}{
+			"usage_percent": 45.2,
+			"core_count":    8,
+		},
+		"memory": map[string]interface{}{
+			"usage_percent": 68.7,
+			"used_gb":       10.9,
+			"total_gb":      16.0,
+		},
+		"kafka": map[string]interface{}{
+			"lag":               1247,
+			"messages_per_sec":  2450,
+			"consumption_rate":  2445,
+			"connection_status": "healthy",
+		},
+		"database": map[string]interface{}{
+			"queries_per_sec":    85,
+			"response_latency":   24.5,
+			"active_connections": 12,
+			"connection_status":  "healthy",
+		},
+		"last_updated": time.Now().Unix(),
+	}
+}
+
 // getPerformanceMetrics returns current model performance metrics
 func getPerformanceMetrics(c *gin.Context) {
 	// TODO: Fetch real performance metrics from Analytics Engine
@@ -586,8 +616,8 @@ func getCalibrationStatus(c *gin.Context) {
 	c.JSON(resp.StatusCode, status)
 }
 
-// startAutoCalibration triggers automatic calibration of all models
-func startAutoCalibration(c *gin.Context) {
+// getInfrastructureMetrics returns infrastructure monitoring metrics
+func getInfrastructureMetrics(c *gin.Context) {
 	// Get analytics engine URL from environment or use default
 	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
 	if analyticsEngineURL == "" {
@@ -595,9 +625,45 @@ func startAutoCalibration(c *gin.Context) {
 	}
 
 	// Make HTTP request to analytics engine
+	resp, err := httpClient.Get(analyticsEngineURL + "/api/v1/infrastructure/metrics")
+	if err != nil {
+		log.Printf("Error fetching infrastructure metrics from analytics engine: %v", err)
+		// Fallback to mock data
+		metrics := getMockInfrastructureMetrics()
+		c.JSON(200, metrics)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Decode response
+	var metrics map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
+		log.Printf("Error decoding infrastructure metrics response: %v", err)
+		// Fallback to mock data
+		mockMetrics := getMockInfrastructureMetrics()
+		c.JSON(200, mockMetrics)
+		return
+	}
+
+	c.JSON(resp.StatusCode, metrics)
+}
+
+// startAutoCalibration triggers automatic calibration of all models
+func startAutoCalibration(c *gin.Context) {
+	log.Printf("🔧 API Gateway: Starting auto-calibration request...")
+
+	// Get analytics engine URL from environment or use default
+	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
+	if analyticsEngineURL == "" {
+		analyticsEngineURL = "http://analytics-engine:8081"
+	}
+
+	log.Printf("🔧 API Gateway: Making request to analytics engine at %s", analyticsEngineURL)
+
+	// Make HTTP request to analytics engine
 	resp, err := httpClient.Post(analyticsEngineURL+"/api/v1/ml/calibration/start", "application/json", nil)
 	if err != nil {
-		log.Printf("Error starting auto calibration: %v", err)
+		log.Printf("❌ API Gateway: Error starting auto calibration: %v", err)
 		// Fallback to mock response
 		response := gin.H{
 			"status":  "success",
@@ -609,10 +675,12 @@ func startAutoCalibration(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	log.Printf("🔧 API Gateway: Received response from analytics engine with status %d", resp.StatusCode)
+
 	// Decode response
 	var response map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		log.Printf("Error decoding auto calibration response: %v", err)
+		log.Printf("❌ API Gateway: Error decoding auto calibration response: %v", err)
 		// Fallback to mock response
 		mockResponse := gin.H{
 			"status":  "success",
@@ -623,6 +691,7 @@ func startAutoCalibration(c *gin.Context) {
 		return
 	}
 
+	log.Printf("✅ API Gateway: Successfully forwarded auto-calibration response")
 	c.JSON(resp.StatusCode, response)
 }
 
