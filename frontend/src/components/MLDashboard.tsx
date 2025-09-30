@@ -496,18 +496,13 @@ export const MLDashboard: React.FC = () => {
     }
 
     // Create new WebSocket connection
-    // When running in browser, use the proxy path which will be handled by Vite
-    // When running in Docker, use the relative path which will be proxied
-    let wsUrl: string;
-    if (window.location.host.includes('localhost:3000')) {
-      // When running locally in development, use the proxy path
-      wsUrl = '/ws';
-    } else {
-      // When running in Docker, use the relative path which will be proxied
-      wsUrl = '/ws';
-    }
+    // Use the proxy path which will be handled by Vite
+    const wsUrl = '/ws';
     
     console.log(`Connecting to WebSocket at: ${wsUrl}`);
+    console.log(`Window location: ${window.location.host}`);
+    console.log(`Includes localhost:3000: ${window.location.host.includes('localhost:3000')}`);
+    
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 

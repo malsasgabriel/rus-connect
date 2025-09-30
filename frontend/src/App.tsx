@@ -12,8 +12,6 @@ import { AdvancedTraderMind } from './components/AdvancedTraderMind';
 import { ModelVotingPanel } from './components/ModelVotingPanel';
 import { TraderMindFull } from './components/TraderMindFull';
 
-const API_GATEWAY_WS = import.meta.env.VITE_API_GATEWAY_WS || 'ws://localhost:8080/ws';
-
 const App: React.FC = () => {
   const [marketData, setMarketData] = useState<MarketPair[]>([]);
   const [tradingSignals, setTradingSignals] = useState<TradingSignal[]>([]);
@@ -27,7 +25,18 @@ const App: React.FC = () => {
   // ...existing code...
 
   useEffect(() => {
-    const ws = new WebSocket(API_GATEWAY_WS);
+    // Create WebSocket connection using the same logic as MLDashboard
+    let wsUrl: string;
+    if (window.location.host.includes('localhost:3000')) {
+      // When running locally in development, use the proxy path
+      wsUrl = '/ws';
+    } else {
+      // When running in Docker, use the relative path which will be proxied
+      wsUrl = '/ws';
+    }
+    
+    console.log(`Connecting to WebSocket at: ${wsUrl}`);
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       console.log('WebSocket Connected');
