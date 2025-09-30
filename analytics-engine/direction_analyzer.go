@@ -508,7 +508,7 @@ func (da *DirectionAnalyzer) publishPrediction(prediction DirectionPrediction) {
 			"timestamp":  prediction.CreatedAt.Format(time.RFC3339),
 			"features":   prediction.Features,
 		}
-		go PublishModelAnalysisDBAndKafka(da.db, da.kafkaBrokers, payload)
+		go PublishModelAnalysisDBAndKafka(context.Background(), da.db, da.kafkaBrokers, payload)
 	}
 }
 

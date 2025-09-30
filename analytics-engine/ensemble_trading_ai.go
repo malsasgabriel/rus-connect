@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -382,7 +383,7 @@ func (ensemble *EnsembleTradingAI) PredictHighAccuracy(symbol string, marketData
 			"confidence": lstmPred.Confidence,
 			"timestamp":  time.Now().UTC().Format(time.RFC3339),
 		}
-		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+		PublishModelAnalysisDBAndKafka(context.Background(), ensemble.DB, ensemble.KafkaBrokers, payload)
 
 		// XGBoost
 		payload = map[string]interface{}{
@@ -392,7 +393,7 @@ func (ensemble *EnsembleTradingAI) PredictHighAccuracy(symbol string, marketData
 			"confidence": xgboostPred.Confidence,
 			"timestamp":  time.Now().UTC().Format(time.RFC3339),
 		}
-		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+		PublishModelAnalysisDBAndKafka(context.Background(), ensemble.DB, ensemble.KafkaBrokers, payload)
 
 		// Transformer
 		payload = map[string]interface{}{
@@ -402,7 +403,7 @@ func (ensemble *EnsembleTradingAI) PredictHighAccuracy(symbol string, marketData
 			"confidence": transformerPred.Confidence,
 			"timestamp":  time.Now().UTC().Format(time.RFC3339),
 		}
-		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+		PublishModelAnalysisDBAndKafka(context.Background(), ensemble.DB, ensemble.KafkaBrokers, payload)
 
 		// Ensemble final
 		payload = map[string]interface{}{
@@ -412,7 +413,7 @@ func (ensemble *EnsembleTradingAI) PredictHighAccuracy(symbol string, marketData
 			"confidence": ensemblePred.Confidence,
 			"timestamp":  time.Now().UTC().Format(time.RFC3339),
 		}
-		PublishModelAnalysisDBAndKafka(ensemble.DB, ensemble.KafkaBrokers, payload)
+		PublishModelAnalysisDBAndKafka(context.Background(), ensemble.DB, ensemble.KafkaBrokers, payload)
 	}()
 
 	return result, nil

@@ -28,7 +28,7 @@ func EnsureModelAnalysesTable(db *sql.DB) {
 }
 
 // PublishModelAnalysisDBAndKafka writes model analysis to DB and Kafka topic `model_analyses`.
-func PublishModelAnalysisDBAndKafka(db *sql.DB, brokers []string, payload map[string]interface{}) error {
+func PublishModelAnalysisDBAndKafka(ctx context.Context, db *sql.DB, brokers []string, payload map[string]interface{}) error {
 	// Marshal payload
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -73,7 +73,7 @@ func PublishModelAnalysisDBAndKafka(db *sql.DB, brokers []string, payload map[st
 	}
 	defer writer.Close()
 
-	err = writer.WriteMessages(context.Background(), kafka.Message{
+	err = writer.WriteMessages(ctx, kafka.Message{
 		Key:   []byte(symbol),
 		Value: b,
 	})

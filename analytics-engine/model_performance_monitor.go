@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -99,8 +100,13 @@ func NewModelPerformanceMonitor(selfLearningEngine *SelfLearningEngine) *ModelPe
 	}
 }
 
+// Stop shuts down the performance monitor
+func (mpm *ModelPerformanceMonitor) Stop() {
+	log.Println("🛑 Model Performance Monitor stopped")
+}
+
 // MonitorPerformance continuously monitors model performance
-func (mpm *ModelPerformanceMonitor) MonitorPerformance() {
+func (mpm *ModelPerformanceMonitor) MonitorPerformance(ctx context.Context) {
 	log.Println("🔍 Starting Model Performance Monitor...")
 
 	ticker := time.NewTicker(5 * time.Minute)
@@ -108,6 +114,9 @@ func (mpm *ModelPerformanceMonitor) MonitorPerformance() {
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Println("Model Performance Monitor stopping due to context cancellation")
+			return
 		case <-ticker.C:
 			mpm.collectMetrics()
 			mpm.analyzePerformance()

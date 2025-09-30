@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -58,15 +59,24 @@ func NewMLAnalyticsIntegration(analyticsEngine *AnalyticsEngine) *MLAnalyticsInt
 func (mli *MLAnalyticsIntegration) startMLProcessing() {
 	mli.signalProcessor.isProcessing = true
 
+	// Create a ticker for periodic predictions
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
 	for mli.isActive {
 		select {
 		case candle := <-mli.analyticsEngine.candleStream:
 			// Process new candle through ML pipeline
 			mli.processNewCandle(candle)
 
-		case <-time.After(60 * time.Second):
+		case <-ticker.C:
 			// Generate predictions every minute
 			mli.generateMLPredictions()
+
+		case <-mli.analyticsEngine.ctx.Done():
+			// Context cancelled, stop processing
+			log.Println("ML processing stopping due to context cancellation")
+			return
 		}
 	}
 }
@@ -158,7 +168,7 @@ func (mli *MLAnalyticsIntegration) emitMLSignal(symbol string, signal *TradingSi
 		"price_target": signal.PriceTarget,
 		"timestamp":    time.Now().UTC().Format(time.RFC3339),
 	}
-	go PublishModelAnalysisDBAndKafka(mli.analyticsEngine.db, mli.analyticsEngine.kafkaBrokers, payload)
+	go PublishModelAnalysisDBAndKafka(context.Background(), mli.analyticsEngine.db, mli.analyticsEngine.kafkaBrokers, payload)
 }
 
 // 🔄 Convert ML Prediction to Direction

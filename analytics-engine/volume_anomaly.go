@@ -82,7 +82,7 @@ func (v *VolumeAnomalyDetector) ProcessCandle(c Candle) {
 			}
 			m := msg{Symbol: c.Symbol, Timestamp: c.Timestamp, Volume: c.Volume, Avg: avg}
 			// best-effort publish
-			v.kafkaWriter.WriteMessages(context.Background(), kafka.Message{Key: []byte(c.Symbol), Value: []byte(fmt.Sprintf("%s %.8f %.8f", m.Symbol, m.Volume, m.Avg))})
+			v.kafkaWriter.WriteMessages(context.Background(), kafka.Message{Key: []byte(c.Symbol), Value: []byte(fmt.Sprintf("%s %d %.8f %.8f", m.Symbol, m.Timestamp, m.Volume, m.Avg))})
 		}
 	}
 }

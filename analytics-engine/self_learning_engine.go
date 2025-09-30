@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -183,6 +184,15 @@ func (sle *SelfLearningEngine) Start() {
 	log.Println("✅ Self-Learning Engine started successfully")
 }
 
+// Stop shuts down the self-learning engine
+func (sle *SelfLearningEngine) Stop() {
+	sle.mutex.Lock()
+	sle.isRunning = false
+	sle.mutex.Unlock()
+
+	log.Println("🛑 Self-Learning Engine stopped")
+}
+
 // PredictWithEnsemble generates prediction using ensemble of models
 func (sle *SelfLearningEngine) PredictWithEnsemble(symbol string, features [][]float64) *TradingSignal {
 	sle.mutex.RLock()
@@ -276,7 +286,7 @@ func (sle *SelfLearningEngine) PredictWithEnsemble(symbol string, features [][]f
 			"confidence": signal.Confidence,
 			"timestamp":  time.Now().UTC().Format(time.RFC3339),
 		}
-		PublishModelAnalysisDBAndKafka(sle.DB, sle.KafkaBrokers, payload)
+		PublishModelAnalysisDBAndKafka(context.Background(), sle.DB, sle.KafkaBrokers, payload)
 	}()
 
 	return signal
