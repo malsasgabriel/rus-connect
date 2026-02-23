@@ -1,0 +1,15 @@
+[wsl2]
+# Memory limit - set to 4GB to prevent Vmmem from consuming all RAM
+memory=4GB
+
+# Swap file size
+swap=2GB
+
+# Enable page reporting to return memory to Windows
+pageReporting=true
+
+# Limit processors to 2 cores
+processors=2
+
+# Enable dense networking for better performance
+denseNetworking=true

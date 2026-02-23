@@ -1,0 +1,14 @@
+{
+  "package": {
+    "productName": "Rus-Connect Scalper",
+    "version": "0.1.0"
+  },
+  "identifier": "com.rusconnect.scalper",
+  "plugins": {},
+  "build": {
+    "distDir": "../dist",
+    "devPath": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  }
+}

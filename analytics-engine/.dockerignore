@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+analytics-engine
+analytics-engine.exe
+analytics-engine-simple
+analytics-engine-simple.exe
+analytics-engine-test
+temp.exe
+
+# Test files
+*_test.go
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Documentation
+*.md
+
+# Git
+.git
+.gitignore
+
