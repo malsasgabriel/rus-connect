@@ -60,21 +60,28 @@ jobs:
           path: ${{ steps.check.outputs.log }}
           if-no-files-found: ignore
 
-      - name: Comment failure on the pull request
-        if: always() && steps.check.outputs.status == '1' && github.event_name == 'pull_request'
+      - name: Report result on the pull request
+        if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           body="$RUNNER_TEMP/comment.md"
-          {
-            echo "### CI failed: \`${{ matrix.module }}\`"
-            echo
-            echo "Commit \`${{ github.sha }}\` - [full log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-            echo
-            echo '```'
-            tail -n 150 "${{ steps.check.outputs.log }}"
-            echo '```'
-          } > "$body"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ steps.check.outputs.status }}" = "0" ]; then
+            {
+              echo "CI OK: \`${{ matrix.module }}\` - vet, build and \`go test -race\` all passed (\`${{ github.sha }}\`, [run]($run_url))"
+            } > "$body"
+          else
+            {
+              echo "### CI FAILED: \`${{ matrix.module }}\`"
+              echo
+              echo "Commit \`${{ github.sha }}\` - [full log]($run_url)"
+              echo
+              echo '```'
+              tail -n 150 "${{ steps.check.outputs.log }}" 2>/dev/null || echo 'no log captured'
+              echo '```'
+            } > "$body"
+          fi
           gh pr comment "${{ github.event.pull_request.number }}" --body-file "$body"
 
       - name: Fail the job if any step failed
