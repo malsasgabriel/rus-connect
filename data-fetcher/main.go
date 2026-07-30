@@ -78,7 +78,7 @@ var globalBreaker = NewCircuitBreaker(5, 10*time.Second)
 
 func main() {
 	startHealthServer()
-	log.Println("🚀 Data Fetcher: PredPump Radar started")
+	log.Println("\U0001F680 Data Fetcher: PredPump Radar started")
 
 	// Initialize DB with retry
 	for i := 0; i < 20; i++ {
@@ -90,10 +90,10 @@ func main() {
 		time.Sleep(3 * time.Second)
 	}
 	if GetDB() != nil {
-		log.Println("✅ [DB] initialized successfully")
+		log.Println("\u2705 [DB] initialized successfully")
 		// ClickHouse relies on ORDER BY in table engine for efficient reads.
 	} else {
-		log.Println("⚠️ [DB] not initialized; candles won't be persisted to ClickHouse")
+		log.Println("\u26A0\uFE0F [DB] not initialized; candles won't be persisted to ClickHouse")
 	}
 
 	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
@@ -107,24 +107,25 @@ func main() {
 	candleProducer := NewKafkaProducerWrapper(kafkaBrokers, "candle_1m")
 
 	defer func() {
-		log.Println("🔒 Closing Kafka producers...")
+		log.Println("\U0001F512 Closing Kafka producers...")
 		tickerProducer.Close()
 		orderbookProducer.Close()
 		tradesProducer.Close()
 		candleProducer.Close()
 	}()
 
-	// Top 10 cryptocurrencies by market cap for real analysis
+	// Top cryptocurrencies by market cap for real analysis
 	symbols := []string{"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"}
 
 	cc := NewBybitREST()
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// ✅ Graceful shutdown: Listen for termination signals
+	// Graceful shutdown: listen for termination signals
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Start fetch loops
 	for _, s := range symbols {
@@ -135,7 +136,7 @@ func main() {
 	// Wait for shutdown signal
 	go func() {
 		sig := <-sigChan
-		log.Printf("🛑 Received signal %v, initiating graceful shutdown...", sig)
+		log.Printf("\U0001F6D1 Received signal %v, initiating graceful shutdown...", sig)
 		cancel() // Cancel context to stop all goroutines
 	}()
 
@@ -144,15 +145,15 @@ func main() {
 
 	// Close database connection
 	if db := GetDB(); db != nil {
-		log.Println("🔒 Closing database connection...")
+		log.Println("\U0001F512 Closing database connection...")
 		if err := db.Close(); err != nil {
-			log.Printf("❌ Error closing database: %v", err)
+			log.Printf("\u274C Error closing database: %v", err)
 		} else {
-			log.Println("✅ Database connection closed")
+			log.Println("\u2705 Database connection closed")
 		}
 	}
 
-	log.Println("✅ Data Fetcher stopped gracefully")
+	log.Println("\u2705 Data Fetcher stopped gracefully")
 }
 
 func startHealthServer() {
@@ -169,7 +170,8 @@ func startHealthServer() {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "time": time.Now().UTC()})
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if GetDB() == nil || GetDB().Ping() != nil {
+		db := GetDB()
+		if db == nil || db.Ping() != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "not_ready", "db_ready": false})
 			return
@@ -177,10 +179,18 @@ func startHealthServer() {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ready", "db_ready": true})
 	})
 
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
 	go func() {
-		addr := ":" + port
-		log.Printf("Health server listening on %s", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("Health server listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("Health server stopped: %v", err)
 		}
 	}()
@@ -197,7 +207,7 @@ func fetchLoopForSymbol(
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
-	// Увеличил интервалы для уменьшения нагрузки
+	// Larger intervals keep the load on the exchange API low.
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -212,7 +222,6 @@ func fetchLoopForSymbol(
 		case <-ticker.C:
 			globalRateLimiter.Acquire()
 			if globalBreaker.IsOpen() {
-				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 
@@ -221,22 +230,31 @@ func fetchLoopForSymbol(
 			if err != nil {
 				globalBreaker.Fail()
 				log.Printf("Ticker fetch error for %s: %v", symbol, err)
+
 				backoff := time.Duration(100+rand.Intn(200)) * time.Millisecond
-				time.Sleep(backoff)
-				if _, err := cc.FetchTicker(symbol); err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+
+				// Reuse the retried response instead of discarding it: the previous
+				// code spent an extra API call and then dropped the data.
+				md, err = cc.FetchTicker(symbol)
+				if err != nil {
 					globalBreaker.Fail()
-					time.Sleep(200 * time.Millisecond)
+					log.Printf("Ticker retry failed for %s: %v", symbol, err)
 					continue
 				}
+			}
+
+			dp := DataPoint{Symbol: md.Symbol, Price: md.Price, Volume: md.Volume24h, Time: time.Now().Unix()}
+			// Use retry for ticker data (2 retries - less critical than candles)
+			if err := publishToKafkaWithRetry(ctx, tickerProducer, "ticker", md.Symbol, dp, 2); err != nil {
+				log.Printf("Failed to publish ticker for %s after retries: %v", symbol, err)
 			} else {
-				dp := DataPoint{Symbol: md.Symbol, Price: md.Price, Volume: md.Volume24h, Time: time.Now().Unix()}
-				// ✅ Use retry for ticker data (2 retries - less critical than candles)
-				if err := publishToKafkaWithRetry(ctx, tickerProducer, "ticker", md.Symbol, dp, 2); err != nil {
-					log.Printf("Failed to publish ticker for %s after retries: %v", symbol, err)
-				} else {
-					log.Printf("Published ticker for %s: Price=%.2f, Volume=%.2f", md.Symbol, md.Price, md.Volume24h)
-					globalBreaker.Success() // Mark success if ticker fetch and publish are OK
-				}
+				log.Printf("Published ticker for %s: Price=%.2f, Volume=%.2f", md.Symbol, md.Price, md.Volume24h)
+				globalBreaker.Success() // Mark success if ticker fetch and publish are OK
 			}
 
 			// Fetch orderbook (lower priority, less frequent)
@@ -278,11 +296,11 @@ func fetchLoopForSymbol(
 					} else {
 						log.Printf("[DB] Saved 1m candle for %s: Close=%.2f, Volume=%.2f", c.Symbol, c.Close, c.Volume)
 					}
-					// ✅ Publish candles to Kafka with retry (critical for ML)
+					// Publish candles to Kafka with retry (critical for ML)
 					if err := publishToKafkaWithRetry(ctx, candleProducer, "candle_1m", c.Symbol, c, 3); err != nil {
-						log.Printf("❌ Failed to publish candle for %s after retries: %v", symbol, err)
+						log.Printf("\u274C Failed to publish candle for %s after retries: %v", symbol, err)
 					} else {
-						log.Printf("✅ Published 1m candle for %s to Kafka", c.Symbol)
+						log.Printf("\u2705 Published 1m candle for %s to Kafka", c.Symbol)
 					}
 				}
 			} else if err != nil {
@@ -301,7 +319,7 @@ func publishToKafka(ctx context.Context, producer *KafkaProducerWrapper, topic, 
 	return producer.Publish(ctx, []byte(key), value)
 }
 
-// publishToKafkaWithRetry publishes to Kafka with exponential backoff retry
+// publishToKafkaWithRetry publishes to Kafka with exponential backoff retry.
 func publishToKafkaWithRetry(
 	ctx context.Context,
 	producer *KafkaProducerWrapper,
@@ -314,9 +332,16 @@ func publishToKafkaWithRetry(
 		return fmt.Errorf("failed to marshal data for topic %s: %w", topic, err)
 	}
 
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
+
+	// lastErr must not be shadowed inside the loop, otherwise the error returned
+	// below always wraps the (nil) marshal error and the real cause is lost.
+	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		err := producer.Publish(ctx, []byte(key), value)
-		if err == nil {
+		lastErr = producer.Publish(ctx, []byte(key), value)
+		if lastErr == nil {
 			return nil
 		}
 
@@ -325,16 +350,15 @@ func publishToKafkaWithRetry(
 			backoffDuration := time.Duration(1<<uint(attempt)) * 100 * time.Millisecond
 
 			log.Printf("Kafka publish to %s failed (attempt %d/%d): %v. Retrying in %v...",
-				topic, attempt+1, maxRetries, err, backoffDuration)
+				topic, attempt+1, maxRetries, lastErr, backoffDuration)
 
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("context cancelled during retry: %w", ctx.Err())
 			case <-time.After(backoffDuration):
-				continue
 			}
 		}
 	}
 
-	return fmt.Errorf("failed to publish to %s after %d retries: %w", topic, maxRetries, err)
+	return fmt.Errorf("failed to publish to %s after %d attempts: %w", topic, maxRetries, lastErr)
 }
