@@ -8,9 +8,24 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/segmentio/kafka-go"
+)
+
+const (
+	// writeWait is the maximum time allowed to write a message to a peer.
+	writeWait = 10 * time.Second
+	// pongWait is how long we wait for the next pong before dropping the peer.
+	pongWait = 60 * time.Second
+	// pingPeriod must be shorter than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+	// maxMessageSize caps inbound frames; clients are not expected to send data.
+	maxMessageSize = 4096
+
+	kafkaMinBackoff = 100 * time.Millisecond
+	kafkaMaxBackoff = 30 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -42,7 +57,7 @@ type Hub struct {
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
-	mu         sync.RWMutex
+	mu         sync.Mutex
 }
 
 func newHub() *Hub {
@@ -69,7 +84,11 @@ func (h *Hub) run() {
 			}
 			h.mu.Unlock()
 		case message := <-h.broadcast:
-			h.mu.RLock()
+			// Slow clients are evicted from the map below, so this branch mutates
+			// shared state and must hold the write lock. Using RLock here was a
+			// data race that could panic with "concurrent map iteration and map
+			// write".
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
@@ -78,7 +97,7 @@ func (h *Hub) run() {
 					delete(h.clients, client)
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 		}
 	}
 }
@@ -101,28 +120,49 @@ func (c *Client) readPump(hub *Hub) {
 		hub.unregister <- c
 		c.conn.Close()
 	}()
+
+	c.conn.SetReadLimit(maxMessageSize)
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	for {
-		_, _, err := c.conn.ReadMessage()
-		if err != nil {
+		if _, _, err := c.conn.ReadMessage(); err != nil {
 			break
 		}
 	}
 }
 
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
 	for {
-		message, ok := <-c.send
-		if !ok {
-			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-			return
+		select {
+		case message, ok := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
-		c.conn.WriteMessage(websocket.TextMessage, message)
 	}
 }
 
 func main() {
-	log.Println("🚀 Starting WebSocket Server...")
+	log.Println("\U0001F680 Starting WebSocket Server...")
 
 	hub := newHub()
 	go hub.run()
@@ -143,32 +183,51 @@ func main() {
 
 	// Consume Kafka messages in a background goroutine
 	go func() {
+		backoff := kafkaMinBackoff
 		for {
 			m, err := r.ReadMessage(context.Background())
 			if err != nil {
-				log.Printf("Error reading kafka message: %v", err)
+				// Without a delay a permanent broker failure turns this loop into
+				// a CPU-burning spin that floods the logs.
+				log.Printf("Error reading kafka message: %v (retrying in %v)", err, backoff)
+				time.Sleep(backoff)
+				if backoff < kafkaMaxBackoff {
+					backoff *= 2
+					if backoff > kafkaMaxBackoff {
+						backoff = kafkaMaxBackoff
+					}
+				}
 				continue
 			}
+			backoff = kafkaMinBackoff
 			// Broadcast the message value (JSON signal) to all connected clients
 			hub.broadcast <- m.Value
 		}
 	}()
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		serveWs(hub, w, r)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, req *http.Request) {
+		serveWs(hub, w, req)
 	})
-	http.HandleFunc("/health", healthzHandler)
-	http.HandleFunc("/healthz", healthzHandler)
-	http.HandleFunc("/readyz", readyzHandler(r))
+	mux.HandleFunc("/health", healthzHandler)
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/readyz", readyzHandler(r))
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8082" // Default to 8082 to avoid conflict with API Gateway (8080) and Analytics (8081)
 	}
 
+	// No WriteTimeout: it would kill long-lived websocket connections.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
 	log.Printf("Listening on :%s", port)
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
 }
