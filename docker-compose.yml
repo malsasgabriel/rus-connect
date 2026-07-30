@@ -10,17 +10,21 @@ services:
       - predpump-network
       - default # Allow access to external APIs
     restart: on-failure
+    # Published so health and metrics are reachable from the host (and from CI).
+    ports:
+      - "8083:8083"
     environment:
       <<: *clickhouse-dsn
       KAFKA_BROKERS: kafka:9092
       DATA_FETCHER_PORT: "8083"
+      BYBIT_BASE_URL: ${BYBIT_BASE_URL:-https://api.bybit.com}
     depends_on:
       kafka-init:
         condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8083/healthz"]
       interval: 15s
       timeout: 5s
       retries: 8
@@ -56,7 +60,7 @@ services:
     ports:
       - "8081:8081"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -92,7 +96,7 @@ services:
       analytics-engine:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
       interval: 15s
       timeout: 5s
       retries: 8
@@ -121,7 +125,7 @@ services:
       kafka-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8082/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8082/healthz"]
       interval: 15s
       timeout: 5s
       retries: 8
@@ -148,11 +152,12 @@ services:
     depends_on:
       api-gateway:
         condition: service_healthy
+    # 127.0.0.1, not localhost: busybox wget tries ::1 first.
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/healthz"]
-      interval: 15s
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/healthz"]
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 6
       start_period: 10s
     deploy:
       resources:
@@ -186,7 +191,7 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-app}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-app_password}
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8123/ping"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -262,8 +267,9 @@ services:
       - kafka_data:/var/lib/kafka/data
 
   # KAFKA_CREATE_TOPICS only works on wurstmeister/kafka; on cp-kafka it was
-  # silently ignored, so services raced against auto-creation (and "ticker" and
-  # "pump_signals" were not even listed).
+  # silently ignored. Note the single-item list below: a block scalar gets
+  # re-split into words by compose, which made bash run `bash -c set` and
+  # skip topic creation entirely.
   kafka-init:
     image: confluentinc/cp-kafka:7.4.0
     networks:
@@ -273,13 +279,15 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-c"]
-    command: |
-      set -e
-      for topic in ticker orderbook trades candle_1m direction_signals pump_signals; do
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-          --topic "$$topic" --partitions 1 --replication-factor 1
-      done
-      echo "Kafka topics ready"
+    command:
+      - |
+        set -euo pipefail
+        for topic in ticker orderbook trades candle_1m direction_signals pump_signals; do
+          kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+        echo "--- topics now present ---"
+        kafka-topics --bootstrap-server kafka:9092 --list
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
