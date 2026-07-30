@@ -4,9 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   go:
@@ -28,14 +30,53 @@ jobs:
           go-version: '1.24'
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
-      - name: go vet
+      - name: vet / build / test
+        id: check
         working-directory: ${{ matrix.module }}
-        run: go vet ./...
+        run: |
+          log="$RUNNER_TEMP/${{ matrix.module }}.log"
+          : > "$log"
+          status=0
+          run_step() {
+            echo "### $*" >> "$log"
+            if ! "$@" >> "$log" 2>&1; then
+              status=1
+              echo "^^^ FAILED: $*" >> "$log"
+            fi
+            echo >> "$log"
+          }
+          run_step go vet ./...
+          run_step go build ./...
+          run_step go test -race ./...
+          cat "$log"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "log=$log" >> "$GITHUB_OUTPUT"
 
-      - name: go build
-        working-directory: ${{ matrix.module }}
-        run: go build ./...
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-${{ matrix.module }}
+          path: ${{ steps.check.outputs.log }}
+          if-no-files-found: ignore
 
-      - name: go test (race)
-        working-directory: ${{ matrix.module }}
-        run: go test -race ./...
+      - name: Comment failure on the pull request
+        if: always() && steps.check.outputs.status == '1' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body="$RUNNER_TEMP/comment.md"
+          {
+            echo "### CI failed: \`${{ matrix.module }}\`"
+            echo
+            echo "Commit \`${{ github.sha }}\` - [full log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo
+            echo '```'
+            tail -n 150 "${{ steps.check.outputs.log }}"
+            echo '```'
+          } > "$body"
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$body"
+
+      - name: Fail the job if any step failed
+        if: steps.check.outputs.status == '1'
+        run: exit 1
