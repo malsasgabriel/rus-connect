@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -14,6 +18,7 @@ jobs:
   go:
     name: ${{ matrix.module }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -68,9 +73,7 @@ jobs:
           body="$RUNNER_TEMP/comment.md"
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ "${{ steps.check.outputs.status }}" = "0" ]; then
-            {
-              echo "CI OK: \`${{ matrix.module }}\` - vet, build and \`go test -race\` all passed (\`${{ github.sha }}\`, [run]($run_url))"
-            } > "$body"
+            echo "CI OK: \`${{ matrix.module }}\` - vet, build and \`go test -race\` all passed (\`${{ github.sha }}\`, [run]($run_url))" > "$body"
           else
             {
               echo "### CI FAILED: \`${{ matrix.module }}\`"
