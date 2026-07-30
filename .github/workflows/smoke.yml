@@ -1,8 +1,8 @@
-name: Smoke (docker compose)
+name: Smoke (docker compose + browser)
 
-# Actually boots the whole stack on the runner: build -> up -> health probes.
-# This is the closest thing to "does the project really work" that can run
-# without a local machine.
+# Actually boots the whole stack on the runner: build -> up -> health probes ->
+# real browser against the real dashboard. This is the closest thing to "does
+# the project work" that can run without a local machine.
 
 on:
   pull_request:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   compose:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -52,10 +52,36 @@ jobs:
           probe analytics-engine http://localhost:8081/healthz || status=1
           probe api-gateway      http://localhost:8080/healthz || status=1
           probe data-fetcher     http://localhost:8083/healthz || status=1
-          probe frontend         http://localhost:3000/         || status=1
-          # readyz means the gateway can actually reach the analytics engine
-          probe gateway-ready    http://localhost:8080/readyz    || status=1
+          probe frontend         http://localhost:3000/        || status=1
+          # readyz is green only if the gateway can really reach the ML engine
+          probe gateway-ready    http://localhost:8080/readyz   || status=1
           echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.up.outputs.status == '0'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        if: steps.up.outputs.status == '0'
+        working-directory: e2e
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Browser tests
+        id: e2e
+        if: steps.up.outputs.status == '0'
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: http://localhost:3000
+        run: |
+          set +e
+          npx playwright test 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Collect state and logs
         if: always()
@@ -65,7 +91,7 @@ jobs:
             echo '--- docker compose ps ---'
             docker compose ps || true
             echo
-            for svc in kafka-init data-fetcher analytics-engine api-gateway websocket-server frontend; do
+            for svc in kafka-init data-fetcher analytics-engine api-gateway frontend; do
               echo "--- logs: $svc (tail 60) ---"
               docker compose logs --tail 60 "$svc" 2>&1 || true
               echo
@@ -73,32 +99,53 @@ jobs:
           } > "$out"
           cat "$out"
 
-      - name: Upload logs
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-logs
-          path: ${{ runner.temp }}/smoke.log
+          name: smoke-artifacts
+          path: |
+            ${{ runner.temp }}/smoke.log
+            ${{ runner.temp }}/e2e.log
+            e2e/playwright-report
+            e2e/test-results
+            e2e/screenshots
           if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Comment result on the pull request
+      - name: Report result on the pull request
         if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ steps.up.outputs.status }}" = "0" ] && [ "${{ steps.probe.outputs.status }}" = "0" ]; then
-            title='### Smoke: the stack came up and every health endpoint answered'
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          up='${{ steps.up.outputs.status }}'
+          probe='${{ steps.probe.outputs.status }}'
+          e2e='${{ steps.e2e.outputs.status }}'
+          if [ "$up" = "0" ] && [ "$probe" = "0" ] && [ "$e2e" = "0" ]; then
+            title='### Smoke OK: the stack came up, health endpoints answered and the browser tests passed'
           else
-            title='### Smoke failed'
+            title='### Smoke FAILED'
           fi
           body="$RUNNER_TEMP/comment.md"
           {
             echo "$title"
             echo
-            echo "Commit \`${{ github.sha }}\` - [full run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "| stage | result |"
+            echo "| --- | --- |"
+            echo "| docker compose build/up | ${up:-skipped} |"
+            echo "| health probes | ${probe:-skipped} |"
+            echo "| playwright | ${e2e:-skipped} |"
             echo
+            echo "Commit \`${{ github.sha }}\` - [full run and artifacts]($run_url)"
+            echo
+            echo '#### playwright'
             echo '```'
-            tail -n 250 "$RUNNER_TEMP/smoke.log" 2>/dev/null || echo 'no log collected'
+            tail -n 120 "$RUNNER_TEMP/e2e.log" 2>/dev/null || echo 'browser tests did not run'
+            echo '```'
+            echo '#### containers'
+            echo '```'
+            tail -n 200 "$RUNNER_TEMP/smoke.log" 2>/dev/null || echo 'no container log collected'
             echo '```'
           } > "$body"
           gh pr comment "${{ github.event.pull_request.number }}" --body-file "$body"
@@ -107,6 +154,6 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans || true
 
-      - name: Fail if the stack did not come up
-        if: steps.up.outputs.status != '0' || steps.probe.outputs.status != '0'
+      - name: Fail if anything went wrong
+        if: steps.up.outputs.status != '0' || steps.probe.outputs.status != '0' || steps.e2e.outputs.status != '0'
         run: exit 1
