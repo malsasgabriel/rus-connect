@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,6 +22,14 @@ import (
 	"github.com/rus-connect/pkg/validator"
 	"github.com/segmentio/kafka-go"
 	"golang.org/x/time/rate"
+)
+
+const (
+	wsWriteWait      = 10 * time.Second
+	wsPongWait       = 60 * time.Second
+	wsPingPeriod     = (wsPongWait * 9) / 10
+	wsMaxMessageSize = 4096
+	wsSendBuffer     = 256
 )
 
 // MarketPair represents a simplified market pair data structure for frontend.
@@ -40,24 +51,24 @@ type PumpSignal struct {
 
 // DirectionSignal represents ML direction predictions
 type DirectionSignal struct {
-	Symbol       string  `json:"symbol"`
-	Direction    string  `json:"direction"`  // "UP", "DOWN", "SIDEWAYS"
-	Confidence   float64 `json:"confidence"` // 0.0 - 1.0
-	ClassProbs   struct {
+	Symbol     string  `json:"symbol"`
+	Direction  string  `json:"direction"`  // "UP", "DOWN", "SIDEWAYS"
+	Confidence float64 `json:"confidence"` // 0.0 - 1.0
+	ClassProbs struct {
 		Down     float64 `json:"down"`
 		Sideways float64 `json:"sideways"`
 		Up       float64 `json:"up"`
 	} `json:"class_probs"`
-	PriceTarget  float64 `json:"price_target"`
-	CurrentPrice float64 `json:"current_price"`
-	TimeHorizon  int     `json:"time_horizon"` // Minutes
-	LabelHorizonMin int   `json:"label_horizon_min"`
-	Timestamp    int64   `json:"timestamp"`    // Unix timestamp (matches analytics engine)
-	StopLoss     float64 `json:"stop_loss"`    // Stop loss price
-	Volatility   float64 `json:"volatility"`   // Market volatility (0-1 scale)
-	TrustStage   string  `json:"trust_stage"`
-	ModelAgeSec  int64   `json:"model_age_sec"`
-	ModelUsed    string  `json:"model_used"`
+	PriceTarget     float64 `json:"price_target"`
+	CurrentPrice    float64 `json:"current_price"`
+	TimeHorizon     int     `json:"time_horizon"` // Minutes
+	LabelHorizonMin int     `json:"label_horizon_min"`
+	Timestamp       int64   `json:"timestamp"`  // Unix timestamp (matches analytics engine)
+	StopLoss        float64 `json:"stop_loss"`  // Stop loss price
+	Volatility      float64 `json:"volatility"` // Market volatility (0-1 scale)
+	TrustStage      string  `json:"trust_stage"`
+	ModelAgeSec     int64   `json:"model_age_sec"`
+	ModelUsed       string  `json:"model_used"`
 }
 
 // TickerData mirrors data-fetcher's DataPoint for ticker topic.
@@ -68,83 +79,115 @@ type TickerData struct {
 	Time   int64   `json:"timestamp"`
 }
 
+// wsClient owns a single websocket connection. gorilla/websocket does not
+// support concurrent writers, so every frame goes through `send` and is written
+// by exactly one goroutine (writePump).
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+}
+
 var (
 	// In-memory store for market pairs (simulate Redis cache)
 	marketData = make(map[string]MarketPair)
 	dataMutex  sync.RWMutex
 
-	// WebSocket clients
 	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			// Allow connections from localhost and the frontend domain
-			origin := r.Header.Get("Origin")
-			return origin == "http://localhost:3000" || origin == "http://frontend:80" || origin == ""
-		},
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     checkOrigin,
 	}
-	wsClients = make(map[*websocket.Conn]bool)
+
+	wsClients = make(map[*wsClient]bool)
 	wsMutex   sync.Mutex
 
 	// Kafka Consumers
 	tickerReader    *kafka.Reader
 	signalReader    *kafka.Reader
-	directionReader *kafka.Reader // 🤖 For ML direction signals
+	directionReader *kafka.Reader
 
 	// HTTP client for communicating with analytics engine
-	httpClient = &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	httpClient = &http.Client{Timeout: 30 * time.Second}
+	// Short-timeout client for readiness probes; the 30s client makes /readyz
+	// outlive the container healthcheck interval.
+	probeClient = &http.Client{Timeout: 2 * time.Second}
 
-	// Rate limiter for API requests
-	limiter = rate.NewLimiter(100, 200) // 100 req/sec, burst 200
+	// Global safety valve; per-IP limiting happens in rateLimitMiddleware.
+	globalLimiter = rate.NewLimiter(500, 1000)
+
+	ipLimiters = make(map[string]*ipLimiterEntry)
+	ipMutex    sync.Mutex
 )
 
+type ipLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser clients (curl, native app) do not send Origin.
+		return true
+	}
+
+	allowed := os.Getenv("WS_ALLOWED_ORIGINS")
+	if allowed == "" {
+		allowed = "http://localhost:3000,http://127.0.0.1:3000"
+	}
+	for _, candidate := range strings.Split(allowed, ",") {
+		if strings.EqualFold(strings.TrimSpace(candidate), origin) {
+			return true
+		}
+	}
+	log.Printf("Rejected websocket origin: %s", origin)
+	return false
+}
+
+func analyticsBaseURL() string {
+	if v := os.Getenv("ANALYTICS_ENGINE_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://analytics-engine:8081"
+}
+
 func main() {
-	log.Println("🚀 API Gateway starting...")
+	if os.Getenv("GIN_MODE") == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
-	r := gin.Default()
+	log.Println("\U0001F680 API Gateway starting...")
 
-	// Add security headers middleware
+	r := gin.New()
+	r.Use(gin.Recovery())
+	// Skip access logs for probes: they run every few seconds and drown the log.
+	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health", "/healthz", "/readyz"}}))
 	r.Use(securityHeadersMiddleware())
-
-	// Add rate limiting middleware
 	r.Use(rateLimitMiddleware())
 
-	// Initialize Kafka Consumers
 	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
 	if kafkaBrokers == "" {
 		kafkaBrokers = "kafka:9092"
 	}
 
-	tickerReader = kafka.NewReader(kafka.ReaderConfig{
-		Brokers:       []string{kafkaBrokers},
-		Topic:         "ticker",
-		GroupID:       "api-gateway-ticker-group",
-		MinBytes:      10e3, // 10KB
-		MaxBytes:      1e6,  // Уменьшил с 10MB до 1MB
-		MaxAttempts:   10,
-		QueueCapacity: 10, // Ограничиваем размер внутренней очереди
-	})
+	// MinBytes 10e3 + the default 10s MaxWait meant a ticker could sit in the
+	// broker for seconds before the gateway saw it. Realtime data wants MinBytes 1.
+	newReader := func(topic, group string) *kafka.Reader {
+		return kafka.NewReader(kafka.ReaderConfig{
+			Brokers:       strings.Split(kafkaBrokers, ","),
+			Topic:         topic,
+			GroupID:       group,
+			MinBytes:      1,
+			MaxBytes:      1e6,
+			MaxWait:       500 * time.Millisecond,
+			MaxAttempts:   10,
+			QueueCapacity: 100,
+		})
+	}
 
-	signalReader = kafka.NewReader(kafka.ReaderConfig{
-		Brokers:       []string{kafkaBrokers},
-		Topic:         "pump_signals",
-		GroupID:       "api-gateway-signals-group",
-		MinBytes:      10e3,
-		MaxBytes:      1e6, // Уменьшил с 10MB до 1MB
-		MaxAttempts:   10,
-		QueueCapacity: 10, // Ограничиваем размер внутренней очереди
-	})
-
-	// 🤖 Direction signals reader for ML predictions
-	directionReader = kafka.NewReader(kafka.ReaderConfig{
-		Brokers:       []string{kafkaBrokers},
-		Topic:         "direction_signals",
-		GroupID:       "api-gateway-direction-group",
-		MinBytes:      10e3,
-		MaxBytes:      1e6, // Уменьшил с 10MB до 1MB
-		MaxAttempts:   10,
-		QueueCapacity: 10, // Ограничиваем размер внутренней очереди
-	})
+	tickerReader = newReader("ticker", "api-gateway-ticker-group")
+	signalReader = newReader("pump_signals", "api-gateway-signals-group")
+	directionReader = newReader("direction_signals", "api-gateway-direction-group")
 
 	// REST API Endpoints
 	r.GET("/health", handleHealthz)
@@ -168,7 +211,6 @@ func main() {
 	r.GET("/api/v1/ml/signal-stats", getSignalStats)
 	r.GET("/api/v1/ml/signals/recent", getRecentSignals)
 	r.GET("/api/v1/ml/signals/history", getSignalsHistory)
-	// Infrastructure monitoring endpoint
 	r.GET("/api/v1/infrastructure/metrics", getInfrastructureMetrics)
 
 	// Proxy trader-mind endpoints to analytics-engine
@@ -179,20 +221,18 @@ func main() {
 	// WebSocket Endpoint
 	r.GET("/ws", wsHandler)
 
-	// ✅ Setup context for background goroutines
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Start background goroutines
 	go consumeTickers(ctx)
 	go consumePumpSignals(ctx)
-	go consumeDirectionSignals(ctx) // 🤖 ML direction signals
-	go broadcastMarketData(ctx)     // Re-use existing broadcast with real data
+	go consumeDirectionSignals(ctx)
+	go broadcastMarketData(ctx)
+	go cleanupIPLimiters(ctx)
 
-	// ✅ Setup graceful shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start HTTP server in goroutine
 	apiGatewayPort := os.Getenv("API_GATEWAY_PORT")
 	if apiGatewayPort == "" {
 		apiGatewayPort = "8080"
@@ -200,54 +240,56 @@ func main() {
 	srv := &http.Server{
 		Addr:    ":" + apiGatewayPort,
 		Handler: r,
+		// No WriteTimeout: it would also cap hijacked websocket connections.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
-		log.Printf("🌐 API Gateway listening on :%s", apiGatewayPort)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("❌ Failed to run API Gateway: %v", err)
+		log.Printf("\U0001F310 API Gateway listening on :%s", apiGatewayPort)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("\u274C Failed to run API Gateway: %v", err)
 		}
 	}()
 
-	// Wait for shutdown signal
 	sig := <-sigChan
-	log.Printf("🛑 Received signal %v, initiating graceful shutdown...", sig)
+	log.Printf("\U0001F6D1 Received signal %v, initiating graceful shutdown...", sig)
 
-	// Cancel context to stop background goroutines
 	cancel()
 
-	// Shutdown HTTP server with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("❌ HTTP server forced to shutdown: %v", err)
+		log.Printf("\u274C HTTP server forced to shutdown: %v", err)
 	} else {
-		log.Println("✅ HTTP server stopped gracefully")
+		log.Println("\u2705 HTTP server stopped gracefully")
 	}
 
-	// Close Kafka readers
-	log.Println("🔒 Closing Kafka readers...")
-	if err := tickerReader.Close(); err != nil {
-		log.Printf("❌ Error closing ticker reader: %v", err)
+	log.Println("\U0001F512 Closing Kafka readers...")
+	for name, reader := range map[string]*kafka.Reader{
+		"ticker":    tickerReader,
+		"signals":   signalReader,
+		"direction": directionReader,
+	} {
+		if reader == nil {
+			continue
+		}
+		if err := reader.Close(); err != nil {
+			log.Printf("\u274C Error closing %s reader: %v", name, err)
+		}
 	}
-	if err := signalReader.Close(); err != nil {
-		log.Printf("❌ Error closing signal reader: %v", err)
-	}
-	if err := directionReader.Close(); err != nil {
-		log.Printf("❌ Error closing direction reader: %v", err)
-	}
-	log.Println("✅ Kafka readers closed")
+	log.Println("\u2705 Kafka readers closed")
 
-	// Close all WebSocket connections
 	wsMutex.Lock()
 	for client := range wsClients {
-		client.Close()
+		delete(wsClients, client)
+		close(client.send)
 	}
 	wsMutex.Unlock()
-	log.Println("✅ WebSocket connections closed")
+	log.Println("\u2705 WebSocket connections closed")
 
-	log.Println("✅ API Gateway stopped gracefully")
+	log.Println("\u2705 API Gateway stopped gracefully")
 }
 
 func handleHealthz(c *gin.Context) {
@@ -260,16 +302,14 @@ func handleHealthz(c *gin.Context) {
 func handleReadyz(c *gin.Context) {
 	kafkaReady := tickerReader != nil && signalReader != nil && directionReader != nil
 
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
 	analyticsReady := false
-	resp, err := httpClient.Get(analyticsEngineURL + "/readyz")
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, analyticsBaseURL()+"/readyz", nil)
 	if err == nil {
-		analyticsReady = resp.StatusCode == http.StatusOK
-		resp.Body.Close()
+		if resp, err := probeClient.Do(req); err == nil {
+			analyticsReady = resp.StatusCode == http.StatusOK
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 	}
 
 	if !kafkaReady || !analyticsReady {
@@ -302,11 +342,46 @@ func securityHeadersMiddleware() gin.HandlerFunc {
 	}
 }
 
-// rateLimitMiddleware provides rate limiting for API requests
+func limiterForIP(ip string) *rate.Limiter {
+	ipMutex.Lock()
+	defer ipMutex.Unlock()
+
+	entry, ok := ipLimiters[ip]
+	if !ok {
+		entry = &ipLimiterEntry{limiter: rate.NewLimiter(50, 100)}
+		ipLimiters[ip] = entry
+	}
+	entry.lastSeen = time.Now()
+	return entry.limiter
+}
+
+// cleanupIPLimiters keeps the per-IP limiter map from growing without bound.
+func cleanupIPLimiters(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-15 * time.Minute)
+			ipMutex.Lock()
+			for ip, entry := range ipLimiters {
+				if entry.lastSeen.Before(cutoff) {
+					delete(ipLimiters, ip)
+				}
+			}
+			ipMutex.Unlock()
+		}
+	}
+}
+
+// rateLimitMiddleware applies a per-client budget plus a global safety valve.
+// A single global bucket let one noisy client starve everybody else.
 func rateLimitMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if !limiter.Allow() {
-			c.JSON(429, gin.H{"error": "Rate limit exceeded"})
+		if !globalLimiter.Allow() || !limiterForIP(c.ClientIP()).Allow() {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded"})
 			c.Abort()
 			return
 		}
@@ -314,26 +389,47 @@ func rateLimitMiddleware() gin.HandlerFunc {
 	}
 }
 
-// consumeTickers consumes ticker data from Kafka and updates in-memory cache.
-func consumeTickers(ctx context.Context) {
-	log.Println("Consuming tickers from Kafka...")
+// consumeLoop is the shared body of the three Kafka consumers.
+func consumeLoop(ctx context.Context, name string, reader *kafka.Reader, handle func(kafka.Message)) {
+	log.Printf("Consuming %s from Kafka...", name)
+
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+
 	for {
-		m, err := tickerReader.FetchMessage(ctx)
+		m, err := reader.FetchMessage(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				log.Println("Ticker consumer context canceled.")
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+				log.Printf("%s consumer stopped.", name)
 				return
 			}
-			log.Printf("Error fetching ticker message from Kafka: %v", err)
-			time.Sleep(1 * time.Second)
+			log.Printf("Error fetching %s message from Kafka: %v (retry in %v)", name, err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
 			continue
 		}
+		backoff = 100 * time.Millisecond
 
+		handle(m)
+
+		if err := reader.CommitMessages(ctx, m); err != nil && ctx.Err() == nil {
+			log.Printf("Error committing %s message: %v", name, err)
+		}
+	}
+}
+
+func consumeTickers(ctx context.Context) {
+	consumeLoop(ctx, "ticker", tickerReader, func(m kafka.Message) {
 		var td TickerData
 		if err := json.Unmarshal(m.Value, &td); err != nil {
 			log.Printf("Error unmarshalling ticker data: %v", err)
-			_ = tickerReader.CommitMessages(ctx, m)
-			continue
+			return
 		}
 
 		dataMutex.Lock()
@@ -344,163 +440,166 @@ func consumeTickers(ctx context.Context) {
 		existing.LastUpdate = time.Now().Unix()
 		marketData[td.Symbol] = existing
 		dataMutex.Unlock()
-
-		if err := tickerReader.CommitMessages(ctx, m); err != nil {
-			log.Printf("Error committing ticker message: %v", err)
-		}
-	}
+	})
 }
 
-// consumePumpSignals consumes pump signals from Kafka and updates anomaly scores or broadcasts directly.
 func consumePumpSignals(ctx context.Context) {
-	log.Println("Consuming pump signals from Kafka...")
-	for {
-		m, err := signalReader.FetchMessage(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				log.Println("Signal consumer context canceled.")
-				return
-			}
-			log.Printf("Error fetching signal message from Kafka: %v", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		var signal PumpSignal
-		if err := json.Unmarshal(m.Value, &signal); err != nil {
+	consumeLoop(ctx, "pump signals", signalReader, func(m kafka.Message) {
+		var sig PumpSignal
+		if err := json.Unmarshal(m.Value, &sig); err != nil {
 			log.Printf("Error unmarshalling pump signal: %v", err)
-			_ = signalReader.CommitMessages(ctx, m)
-			continue
+			return
 		}
 
 		dataMutex.Lock()
-		if existing, ok := marketData[signal.Symbol]; ok {
-			// Update anomaly score and last update
-			existing.AnomalyScore = signal.Probability * 100 // Convert to 0-100 scale
-			existing.LastUpdate = time.Now().Unix()
-			marketData[signal.Symbol] = existing
-		} else {
-			// If pair not seen yet, create a minimal entry
-			marketData[signal.Symbol] = MarketPair{
-				Symbol:       signal.Symbol,
-				AnomalyScore: signal.Probability * 100,
-				LastUpdate:   time.Now().Unix(),
-				Price:        0, // Unknown without ticker data
-				Volume:       0,
-			}
+		existing, ok := marketData[sig.Symbol]
+		if !ok {
+			existing = MarketPair{Symbol: sig.Symbol}
 		}
+		existing.AnomalyScore = sig.Probability * 100 // 0-100 scale
+		existing.LastUpdate = time.Now().Unix()
+		marketData[sig.Symbol] = existing
 		dataMutex.Unlock()
 
-		// Also broadcast the signal directly over WebSocket
 		broadcastWebSocketMessage(map[string]interface{}{
 			"type": "pump_signal_update",
-			"data": signal,
+			"data": sig,
 		})
-
-		if err := signalReader.CommitMessages(ctx, m); err != nil {
-			log.Printf("Error committing signal message: %v", err)
-		}
-	}
+	})
 }
 
-// 🤖 consumeDirectionSignals consumes ML direction signals from Kafka
 func consumeDirectionSignals(ctx context.Context) {
-	log.Println("🤖 Consuming ML direction signals from Kafka...")
-	for {
-		m, err := directionReader.FetchMessage(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				log.Println("Direction consumer context canceled.")
-				return
-			}
-			log.Printf("Error fetching direction message from Kafka: %v", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		// Parse direction signal from analytics engine
+	consumeLoop(ctx, "ML direction signals", directionReader, func(m kafka.Message) {
 		var dirSignal DirectionSignal
 		if err := json.Unmarshal(m.Value, &dirSignal); err != nil {
 			log.Printf("Error unmarshalling direction signal: %v", err)
-			_ = directionReader.CommitMessages(ctx, m)
-			continue
+			return
 		}
 
-		// Use timestamp directly from analytics engine (int64 Unix timestamp)
 		timestampUnix := dirSignal.Timestamp
 		if timestampUnix == 0 {
-			// Fallback to current time if timestamp is missing
 			timestampUnix = time.Now().Unix()
 		}
 
-		// Log the ML signal for monitoring
-		log.Printf("🤖 ML SIGNAL: %s %s (%.1f%% confidence) - Target: %.8f",
-			dirSignal.Symbol, dirSignal.Direction, dirSignal.Confidence*100, dirSignal.PriceTarget)
-
-		// Use model_used field directly from analytics engine
 		resolvedModel := dirSignal.ModelUsed
 		if resolvedModel == "" {
-			resolvedModel = "SimpleNN" // Default model name
+			resolvedModel = "SimpleNN"
 		}
 
-		// Convert to frontend-compatible format
-		frontendSignal := map[string]interface{}{
-			"symbol":        dirSignal.Symbol,
-			"direction":     dirSignal.Direction,
-			"confidence":    dirSignal.Confidence,
-			"class_probs":   dirSignal.ClassProbs,
-			"price_target":  dirSignal.PriceTarget,
-			"current_price": dirSignal.CurrentPrice,
-			"time_horizon":  dirSignal.TimeHorizon,
-			"label_horizon_min": dirSignal.LabelHorizonMin,
-			"timestamp":     timestampUnix,
-			"stop_loss":     dirSignal.StopLoss,
-			"volatility":    dirSignal.Volatility,
-			"trust_stage":   dirSignal.TrustStage,
-			"model_age_sec": dirSignal.ModelAgeSec,
-			"model_used":    resolvedModel,
-		}
+		log.Printf("\U0001F916 ML SIGNAL: %s %s (%.1f%% confidence) - Target: %.8f",
+			dirSignal.Symbol, dirSignal.Direction, dirSignal.Confidence*100, dirSignal.PriceTarget)
 
-		// Broadcast the direction signal to frontend
 		broadcastWebSocketMessage(map[string]interface{}{
 			"type": "direction_signal",
-			"data": frontendSignal,
+			"data": map[string]interface{}{
+				"symbol":            dirSignal.Symbol,
+				"direction":         dirSignal.Direction,
+				"confidence":        dirSignal.Confidence,
+				"class_probs":       dirSignal.ClassProbs,
+				"price_target":      dirSignal.PriceTarget,
+				"current_price":     dirSignal.CurrentPrice,
+				"time_horizon":      dirSignal.TimeHorizon,
+				"label_horizon_min": dirSignal.LabelHorizonMin,
+				"timestamp":         timestampUnix,
+				"stop_loss":         dirSignal.StopLoss,
+				"volatility":        dirSignal.Volatility,
+				"trust_stage":       dirSignal.TrustStage,
+				"model_age_sec":     dirSignal.ModelAgeSec,
+				"model_used":        resolvedModel,
+			},
 		})
-
-		if err := directionReader.CommitMessages(ctx, m); err != nil {
-			log.Printf("Error committing direction message: %v", err)
-		}
-	}
+	})
 }
 
-func getAllPairs(c *gin.Context) {
+func marketSnapshot() []MarketPair {
 	dataMutex.RLock()
 	defer dataMutex.RUnlock()
 	list := make([]MarketPair, 0, len(marketData))
 	for _, p := range marketData {
 		list = append(list, p)
 	}
-	c.JSON(http.StatusOK, list)
+	return list
+}
+
+func getAllPairs(c *gin.Context) {
+	c.JSON(http.StatusOK, marketSnapshot())
 }
 
 func getPair(c *gin.Context) {
 	symbol := c.Param("symbol")
 	if err := validator.ValidateSymbol(symbol); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid symbol format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
 		return
 	}
 	dataMutex.RLock()
-	defer dataMutex.RUnlock()
-	if p, ok := marketData[symbol]; ok {
-		c.JSON(http.StatusOK, p)
+	p, ok := marketData[symbol]
+	dataMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	c.JSON(http.StatusOK, p)
 }
 
 func scanMarket(c *gin.Context) {
-	// For now, scan is same as get all pairs. Can add filters later.
 	getAllPairs(c)
+}
+
+func removeClient(client *wsClient) {
+	wsMutex.Lock()
+	if _, ok := wsClients[client]; ok {
+		delete(wsClients, client)
+		close(client.send)
+	}
+	wsMutex.Unlock()
+}
+
+func (client *wsClient) writePump() {
+	ticker := time.NewTicker(wsPingPeriod)
+	defer func() {
+		ticker.Stop()
+		_ = client.conn.Close()
+	}()
+
+	for {
+		select {
+		case payload, ok := <-client.send:
+			_ = client.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if !ok {
+				_ = client.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := client.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = client.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (client *wsClient) readPump() {
+	defer func() {
+		removeClient(client)
+		_ = client.conn.Close()
+	}()
+
+	client.conn.SetReadLimit(wsMaxMessageSize)
+	_ = client.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	client.conn.SetPongHandler(func(string) error {
+		return client.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+
+	for {
+		// ReadMessage blocks until data or error, so the old time.Sleep here only
+		// delayed disconnect detection.
+		if _, _, err := client.conn.ReadMessage(); err != nil {
+			return
+		}
+	}
 }
 
 func wsHandler(c *gin.Context) {
@@ -509,42 +608,30 @@ func wsHandler(c *gin.Context) {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
-	wsMutex.Lock()
-	wsClients[conn] = true
-	wsMutex.Unlock()
-	defer func() {
-		wsMutex.Lock()
-		delete(wsClients, conn)
-		wsMutex.Unlock()
+
+	client := &wsClient{conn: conn, send: make(chan []byte, wsSendBuffer)}
+
+	initial, err := json.Marshal(map[string]interface{}{
+		"type": "initial_data",
+		"data": marketSnapshot(),
+	})
+	if err != nil {
+		log.Printf("Error encoding initial data: %v", err)
 		_ = conn.Close()
-	}()
-
-	// Send initial data to new client
-	dataMutex.RLock()
-	initialData := make([]MarketPair, 0, len(marketData))
-	for _, p := range marketData {
-		initialData = append(initialData, p)
-	}
-	dataMutex.RUnlock()
-
-	if err := conn.WriteJSON(map[string]interface{}{"type": "initial_data", "data": initialData}); err != nil {
-		log.Printf("Error sending initial data to WS client: %v", err)
 		return
 	}
+	client.send <- initial
 
-	// Keep connection alive
-	for {
-		_, _, err := conn.ReadMessage() // Read messages to detect client disconnect
-		if err != nil {
-			break // Client disconnected
-		}
-		time.Sleep(1 * time.Second) // Prevent busy-looping
-	}
+	wsMutex.Lock()
+	wsClients[client] = true
+	wsMutex.Unlock()
+
+	go client.writePump()
+	client.readPump()
 }
 
-// broadcastMarketData broadcasts current market data to all connected WebSocket clients.
+// broadcastMarketData broadcasts current market data to all connected clients.
 func broadcastMarketData(ctx context.Context) {
-	// Увеличил интервал с 2 до 5 секунд для уменьшения нагрузки
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -554,589 +641,240 @@ func broadcastMarketData(ctx context.Context) {
 			log.Println("Broadcast goroutine stopped")
 			return
 		case <-ticker.C:
-			dataMutex.RLock()
-			data := make([]MarketPair, 0, len(marketData))
-			for _, p := range marketData {
-				data = append(data, p)
-			}
-			dataMutex.RUnlock()
-
 			broadcastWebSocketMessage(map[string]interface{}{
 				"type": "market_update",
-				"data": data,
+				"data": marketSnapshot(),
 			})
 		}
 	}
 }
 
-// broadcastWebSocketMessage sends a message to all connected WebSocket clients.
+// broadcastWebSocketMessage queues a message for every connected client.
+// It never writes to a socket directly, so a slow or dead client can no longer
+// block the broadcaster (or race with another writer).
 func broadcastWebSocketMessage(message interface{}) {
+	payload, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Error encoding websocket message: %v", err)
+		return
+	}
+
 	wsMutex.Lock()
 	defer wsMutex.Unlock()
 	for client := range wsClients {
-		if err := client.WriteJSON(message); err != nil {
-			log.Printf("Error sending to WebSocket client: %v", err)
-			_ = client.Close() // Close connection if sending fails
+		select {
+		case client.send <- payload:
+		default:
+			// Client cannot keep up: drop it instead of stalling everyone.
 			delete(wsClients, client)
+			close(client.send)
 		}
 	}
 }
 
+// proxyJSON forwards a request to the analytics engine and relays the JSON body.
+func proxyJSON(c *gin.Context, method, target string, body io.Reader, unavailable gin.H) {
+	req, err := http.NewRequestWithContext(c.Request.Context(), method, target, body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to build upstream request"})
+		return
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("Error contacting analytics engine (%s): %v", target, err)
+		payload := gin.H{"error": "Analytics Engine unavailable"}
+		for k, v := range unavailable {
+			payload[k] = v
+		}
+		c.JSON(http.StatusServiceUnavailable, payload)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Analytics engine returned %d for %s", resp.StatusCode, target)
+		payload := gin.H{"error": "Analytics Engine returned error", "status": resp.StatusCode}
+		for k, v := range unavailable {
+			payload[k] = v
+		}
+		c.JSON(resp.StatusCode, payload)
+		return
+	}
+
+	var out map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		log.Printf("Error decoding analytics engine response (%s): %v", target, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid response from analytics engine"})
+		return
+	}
+
+	c.JSON(http.StatusOK, out)
+}
+
 // submitFeedback handles manual feedback submission for continuous learning
 func submitFeedback(c *gin.Context) {
+	// NOTE: no `binding:"required"` on the numeric/bool fields. Gin's `required`
+	// rejects zero values, so `actual_pump: false` and `predicted_prob: 0` were
+	// impossible to submit. They are validated explicitly below instead.
 	var feedback struct {
 		Symbol        string  `json:"symbol" binding:"required"`
-		Timestamp     int64   `json:"timestamp" binding:"required"`
-		PredictedProb float64 `json:"predicted_prob" binding:"required"`
-		ActualPump    bool    `json:"actual_pump" binding:"required"`
+		Timestamp     int64   `json:"timestamp"`
+		PredictedProb float64 `json:"predicted_prob"`
+		ActualPump    bool    `json:"actual_pump"`
 		Confidence    float64 `json:"confidence"`
 		Notes         string  `json:"notes"`
 	}
 
 	if err := c.ShouldBindJSON(&feedback); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid feedback data: " + err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid feedback data: " + err.Error()})
 		return
 	}
 
-	// Validate input fields
 	if err := validator.ValidateSymbol(feedback.Symbol); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if feedback.Timestamp == 0 {
+		feedback.Timestamp = time.Now().Unix()
+	}
 	if err := validator.ValidateTimestamp(feedback.Timestamp); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if err := validator.ValidateConfidence(feedback.PredictedProb); err != nil {
-		c.JSON(400, gin.H{"error": "predicted_prob: " + err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "predicted_prob: " + err.Error()})
 		return
 	}
-	if feedback.Confidence != 0 { // Only validate confidence if it's provided
-		if err := validator.ValidateConfidence(feedback.Confidence); err != nil {
-			c.JSON(400, gin.H{"error": "confidence: " + err.Error()})
-			return
-		}
-	}
-
-	// Set default confidence if not provided
 	if feedback.Confidence == 0 {
 		feedback.Confidence = 1.0
 	}
-
-	// Forward to Analytics Engine
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
+	if err := validator.ValidateConfidence(feedback.Confidence); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confidence: " + err.Error()})
+		return
 	}
 
 	jsonData, err := json.Marshal(feedback)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to serialize feedback"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize feedback"})
 		return
 	}
 
-	resp, err := httpClient.Post(analyticsEngineURL+"/api/v1/feedback", "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Printf("Error sending feedback to analytics engine: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to connect to analytics engine"})
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned error: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "Analytics engine rejected feedback"})
-		return
-	}
-
-	c.JSON(200, gin.H{
-		"status":      "success",
-		"message":     "Feedback submitted successfully",
-		"feedback_id": time.Now().Unix(),
-	})
+	proxyJSON(c, http.MethodPost, analyticsBaseURL()+"/api/v1/feedback", bytes.NewReader(jsonData), nil)
 }
 
-// getPerformanceMetrics returns current model performance metrics
 func getPerformanceMetrics(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Make HTTP request to analytics engine
-	resp, err := httpClient.Get(analyticsEngineURL + "/model/performance")
-	if err != nil {
-		log.Printf("Error fetching performance metrics from analytics engine: %v", err)
-		c.JSON(503, gin.H{
-			"error":  "Analytics Engine unavailable",
-			"status": "down",
-		})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if response status is OK
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for performance metrics: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{
-			"error":  "Analytics Engine returned error",
-			"status": "error",
-		})
-		return
-	}
-
-	// Decode response
-	var metrics map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
-		log.Printf("Error decoding performance metrics response: %v", err)
-		c.JSON(500, gin.H{
-			"error":  "Failed to decode response",
-			"status": "error",
-		})
-		return
-	}
-
-	c.JSON(resp.StatusCode, metrics)
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/model/performance", nil, gin.H{"status": "down"})
 }
 
-// getMLMetrics returns detailed ML model performance metrics
+func getModelStats(c *gin.Context) {
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/model/performance", nil, gin.H{"data_status": "empty"})
+}
+
 func getMLMetrics(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Make HTTP request to analytics engine
-	resp, err := httpClient.Get(analyticsEngineURL + "/api/v1/ml/metrics")
-	if err != nil {
-		log.Printf("Error fetching ML metrics from analytics engine: %v", err)
-		c.JSON(503, gin.H{
-			"error":  "Analytics Engine unavailable",
-			"system": gin.H{"overall_health": "UNKNOWN"},
-		})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Decode response
-	var metrics map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
-		log.Printf("Error decoding ML metrics response: %v", err)
-		c.JSON(500, gin.H{
-			"error":  "Failed to decode response",
-			"system": gin.H{"overall_health": "UNKNOWN"},
-		})
-		return
-	}
-
-	c.JSON(resp.StatusCode, metrics)
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/ml/metrics", nil, gin.H{"system": gin.H{"overall_health": "UNKNOWN"}})
 }
 
-// getCalibrationStatus returns the current calibration status of all models
 func getCalibrationStatus(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Make HTTP request to analytics engine
-	resp, err := httpClient.Get(analyticsEngineURL + "/api/v1/ml/calibration")
-	if err != nil {
-		log.Printf("Error fetching calibration status from analytics engine: %v", err)
-		c.JSON(503, gin.H{
-			"error":  "Analytics Engine unavailable",
-			"system": gin.H{"overall_status": "UNKNOWN"},
-		})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Decode response
-	var status map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		log.Printf("Error decoding calibration status response: %v", err)
-		c.JSON(500, gin.H{
-			"error":  "Failed to decode response",
-			"system": gin.H{"overall_status": "UNKNOWN"},
-		})
-		return
-	}
-
-	c.JSON(resp.StatusCode, status)
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/ml/calibration", nil, gin.H{"system": gin.H{"overall_status": "UNKNOWN"}})
 }
 
-// getInfrastructureMetrics returns infrastructure monitoring metrics
-func getInfrastructureMetrics(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Make HTTP request to analytics engine
-	resp, err := httpClient.Get(analyticsEngineURL + "/api/v1/infrastructure/metrics")
-	if err != nil {
-		log.Printf("Error fetching infrastructure metrics from analytics engine: %v", err)
-		c.JSON(503, gin.H{"error": "Analytics Engine unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Decode response
-	var metrics map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
-		log.Printf("Error decoding infrastructure metrics response: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to decode response"})
-		return
-	}
-
-	c.JSON(resp.StatusCode, metrics)
-}
-
-// getTrainingHistory returns model training history from analytics engine
-func getTrainingHistory(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Get query parameters
-	symbol := c.DefaultQuery("symbol", "BTCUSDT")
-	limit := c.DefaultQuery("limit", "50")
-
-	// Make HTTP request to analytics engine
-	url := fmt.Sprintf("%s/api/v1/ml/training-history?symbol=%s&limit=%s", analyticsEngineURL, symbol, limit)
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		log.Printf("Error fetching training history from analytics engine: %v", err)
-		c.JSON(503, gin.H{"error": "Analytics Engine unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if response status is OK
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for training history: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "Analytics Engine returned error"})
-		return
-	}
-
-	// Decode response
-	var history map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&history); err != nil {
-		log.Printf("Error decoding training history response: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to decode response"})
-		return
-	}
-
-	c.JSON(resp.StatusCode, history)
-}
-
-// getSignalStats returns signal statistics from analytics engine
-func getSignalStats(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Get query parameters
-	symbol := c.DefaultQuery("symbol", "BTCUSDT")
-	hours := c.DefaultQuery("hours", "24")
-
-	// Make HTTP request to analytics engine
-	url := fmt.Sprintf("%s/api/v1/ml/signal-stats?symbol=%s&hours=%s", analyticsEngineURL, symbol, hours)
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		log.Printf("Error fetching signal statistics from analytics engine: %v", err)
-		c.JSON(503, gin.H{"error": "Analytics Engine unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if response status is OK
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for signal statistics: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "Analytics Engine returned error"})
-		return
-	}
-
-	// Decode response
-	var stats map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		log.Printf("Error decoding signal statistics response: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to decode response"})
-		return
-	}
-
-	c.JSON(resp.StatusCode, stats)
-}
-
-// getRecentSignals returns recent persisted ML signals from analytics engine
-func getRecentSignals(c *gin.Context) {
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	limit := c.DefaultQuery("limit", "50")
-	hours := c.DefaultQuery("hours", "24")
-	symbol := c.Query("symbol")
-
-	url := fmt.Sprintf("%s/api/v1/ml/signals/recent?limit=%s&hours=%s", analyticsEngineURL, limit, hours)
-	if symbol != "" {
-		url += "&symbol=" + symbol
-	}
-
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		log.Printf("Error fetching recent signals from analytics engine: %v", err)
-		c.JSON(503, gin.H{"error": "Analytics Engine unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for recent signals: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "Analytics Engine returned error"})
-		return
-	}
-
-	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		log.Printf("Error decoding recent signals response: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to decode response"})
-		return
-	}
-
-	c.JSON(resp.StatusCode, payload)
-}
-
-// getSignalsHistory returns historical ML signals from analytics engine
-func getSignalsHistory(c *gin.Context) {
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	limit := c.DefaultQuery("limit", "100")
-	hours := c.DefaultQuery("hours", "168")
-	symbol := c.Query("symbol")
-	direction := c.Query("direction")
-
-	url := fmt.Sprintf("%s/api/v1/ml/signals/history?limit=%s&hours=%s", analyticsEngineURL, limit, hours)
-	if symbol != "" {
-		url += "&symbol=" + symbol
-	}
-	if direction != "" {
-		url += "&direction=" + direction
-	}
-
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		log.Printf("Error fetching signals history from analytics engine: %v", err)
-		c.JSON(503, gin.H{"error": "Analytics Engine unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for signals history: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "Analytics Engine returned error"})
-		return
-	}
-
-	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		log.Printf("Error decoding signals history response: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to decode response"})
-		return
-	}
-
-	c.JSON(resp.StatusCode, payload)
-}
-
-// startAutoCalibration triggers automatic calibration of all models
 func startAutoCalibration(c *gin.Context) {
-	log.Printf("🔧 API Gateway: Starting auto-calibration request...")
-
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	log.Printf("🔧 API Gateway: Making request to analytics engine at %s", analyticsEngineURL)
-
-	// Make HTTP request to analytics engine
-	resp, err := httpClient.Post(analyticsEngineURL+"/api/v1/ml/calibration/start", "application/json", nil)
-	if err != nil {
-		log.Printf("❌ API Gateway: Error starting auto calibration: %v", err)
-		c.JSON(503, gin.H{"error": "Analytics Engine unavailable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	log.Printf("🔧 API Gateway: Received response from analytics engine with status %d", resp.StatusCode)
-
-	// Decode response
-	var response map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		log.Printf("❌ API Gateway: Error decoding auto calibration response: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to decode response"})
-		return
-	}
-
-	log.Printf("✅ API Gateway: Successfully forwarded auto-calibration response")
-	c.JSON(resp.StatusCode, response)
+	proxyJSON(c, http.MethodPost, analyticsBaseURL()+"/api/v1/ml/calibration/start", nil, nil)
 }
 
-// proxyTraderMind forwards a simple summary request to analytics-engine
+func getInfrastructureMetrics(c *gin.Context) {
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/infrastructure/metrics", nil, nil)
+}
+
+func getTrainingHistory(c *gin.Context) {
+	symbol := c.DefaultQuery("symbol", "BTCUSDT")
+	if err := validator.ValidateSymbol(symbol); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
+		return
+	}
+	target := fmt.Sprintf("%s/api/v1/ml/training-history?symbol=%s&limit=%s",
+		analyticsBaseURL(), url.QueryEscape(symbol), url.QueryEscape(c.DefaultQuery("limit", "50")))
+	proxyJSON(c, http.MethodGet, target, nil, nil)
+}
+
+func getSignalStats(c *gin.Context) {
+	symbol := c.DefaultQuery("symbol", "BTCUSDT")
+	if err := validator.ValidateSymbol(symbol); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
+		return
+	}
+	target := fmt.Sprintf("%s/api/v1/ml/signal-stats?symbol=%s&hours=%s",
+		analyticsBaseURL(), url.QueryEscape(symbol), url.QueryEscape(c.DefaultQuery("hours", "24")))
+	proxyJSON(c, http.MethodGet, target, nil, nil)
+}
+
+func getRecentSignals(c *gin.Context) {
+	query := url.Values{}
+	query.Set("limit", c.DefaultQuery("limit", "50"))
+	query.Set("hours", c.DefaultQuery("hours", "24"))
+	if symbol := c.Query("symbol"); symbol != "" {
+		if err := validator.ValidateSymbol(symbol); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
+			return
+		}
+		query.Set("symbol", symbol)
+	}
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/ml/signals/recent?"+query.Encode(), nil, nil)
+}
+
+func getSignalsHistory(c *gin.Context) {
+	query := url.Values{}
+	query.Set("limit", c.DefaultQuery("limit", "100"))
+	query.Set("hours", c.DefaultQuery("hours", "168"))
+	if symbol := c.Query("symbol"); symbol != "" {
+		if err := validator.ValidateSymbol(symbol); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
+			return
+		}
+		query.Set("symbol", symbol)
+	}
+	if direction := c.Query("direction"); direction != "" {
+		switch strings.ToUpper(direction) {
+		case "UP", "DOWN", "SIDEWAYS":
+			query.Set("direction", strings.ToUpper(direction))
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid direction"})
+			return
+		}
+	}
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/ml/signals/history?"+query.Encode(), nil, nil)
+}
+
 func proxyTraderMind(c *gin.Context) {
 	symbol := c.Param("symbol")
-	if symbol == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "symbol required"})
+	if err := validator.ValidateSymbol(symbol); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
 		return
 	}
-
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	resp, err := httpClient.Get(analyticsEngineURL + "/api/v1/trader-mind/" + symbol)
-	if err != nil {
-		log.Printf("Error contacting analytics engine for trader-mind: %v", err)
-		c.JSON(502, gin.H{"error": "failed to contact analytics engine", "details": err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if response status is OK
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for trader-mind: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "analytics engine error", "status": resp.StatusCode})
-		return
-	}
-
-	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		log.Printf("Error decoding trader-mind response: %v", err)
-		c.JSON(502, gin.H{"error": "invalid response from analytics engine", "details": err.Error()})
-		return
-	}
-	c.JSON(resp.StatusCode, payload)
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/trader-mind/"+url.PathEscape(symbol), nil, nil)
 }
 
-// proxyTraderMindFull forwards the full trader mind payload to frontend
 func proxyTraderMindFull(c *gin.Context) {
 	symbol := c.Param("symbol")
-	if symbol == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "symbol required"})
+	if err := validator.ValidateSymbol(symbol); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
 		return
 	}
-
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	resp, err := httpClient.Get(analyticsEngineURL + "/api/v1/trader-mind/full/" + symbol)
-	if err != nil {
-		log.Printf("Error contacting analytics engine for trader-mind/full: %v", err)
-		c.JSON(502, gin.H{"error": "failed to contact analytics engine", "details": err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if response status is OK
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for trader-mind/full: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{"error": "analytics engine error", "status": resp.StatusCode})
-		return
-	}
-
-	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		log.Printf("Error decoding trader-mind/full response: %v", err)
-		c.JSON(502, gin.H{"error": "invalid response from analytics engine", "details": err.Error()})
-		return
-	}
-	c.JSON(resp.StatusCode, payload)
+	proxyJSON(c, http.MethodGet, analyticsBaseURL()+"/api/v1/trader-mind/full/"+url.PathEscape(symbol), nil, nil)
 }
 
 func proxyModelRetrain(c *gin.Context) {
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	targetURL := analyticsEngineURL + "/api/v1/model/retrain"
+	target := analyticsBaseURL() + "/api/v1/model/retrain"
 	if symbol := c.Query("symbol"); symbol != "" {
-		targetURL += "?symbol=" + symbol
+		if err := validator.ValidateSymbol(symbol); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid symbol format"})
+			return
+		}
+		target += "?symbol=" + url.QueryEscape(symbol)
 	}
-
-	resp, err := httpClient.Post(targetURL, "application/json", nil)
-	if err != nil {
-		log.Printf("Error contacting analytics engine for model retrain: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to contact analytics engine"})
-		return
-	}
-	defer resp.Body.Close()
-
-	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid response from analytics engine"})
-		return
-	}
-
-	c.JSON(resp.StatusCode, payload)
-}
-
-// getModelStats returns current model statistics and learning status
-func getModelStats(c *gin.Context) {
-	// Get analytics engine URL from environment or use default
-	analyticsEngineURL := os.Getenv("ANALYTICS_ENGINE_URL")
-	if analyticsEngineURL == "" {
-		analyticsEngineURL = "http://analytics-engine:8081"
-	}
-
-	// Make HTTP request to analytics engine
-	resp, err := httpClient.Get(analyticsEngineURL + "/model/performance")
-	if err != nil {
-		log.Printf("Error fetching model stats from analytics engine: %v", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error":       "Analytics Engine unavailable",
-			"data_status": "empty",
-		})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if response status is OK
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Analytics engine returned non-OK status for model stats: %d", resp.StatusCode)
-		c.JSON(resp.StatusCode, gin.H{
-			"error":       "Analytics Engine returned error",
-			"data_status": "empty",
-		})
-		return
-	}
-
-	// Decode response
-	var stats map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		log.Printf("Error decoding model stats response: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":       "invalid response from analytics engine",
-			"data_status": "empty",
-		})
-		return
-	}
-
-	c.JSON(resp.StatusCode, stats)
+	proxyJSON(c, http.MethodPost, target, nil, nil)
 }
