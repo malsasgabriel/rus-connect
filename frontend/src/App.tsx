@@ -9,10 +9,10 @@ import { LearningDashboard } from './components/LearningDashboard';
 import { TradingSignalDashboard } from './components/TradingSignalDashboard';
 import { MLDashboard } from './components/MLDashboard';
 import { AdvancedTraderMind } from './components/AdvancedTraderMind';
-import { ModelVotingPanel } from './components/ModelVotingPanel';
 import { TraderMindFull } from './components/TraderMindFull';
 import { SignalsHistory } from './components/SignalsHistory';
 import { fetchWithFallback } from './utils/api';
+import { createReconnectingSocket, resolveWsUrl } from './utils/ws';
 
 const SIGNALS_STORAGE_KEY = 'tradingSignals';
 
@@ -21,7 +21,7 @@ function calculateRiskLevel(confidence: number, volatility: number): string {
   // Risk Score = (1 - confidence) * volatility * 100
   // Lower confidence + higher volatility = higher risk
   const riskScore = (1 - confidence) * volatility * 100;
-  
+
   if (riskScore < 0.5) return 'LOW';
   if (riskScore < 1.5) return 'MEDIUM';
   return 'HIGH';
@@ -36,6 +36,16 @@ function toPrediction(direction: string): string {
   if (direction === 'UP') return 'BUY';
   if (direction === 'DOWN') return 'SELL';
   return 'NEUTRAL';
+}
+
+// Merge an incoming snapshot with the current state. The old code mapped over
+// the existing list only, so any symbol missing from the first (usually empty)
+// snapshot never appeared in the table.
+function mergeMarketData(previous: MarketPair[], incoming: MarketPair[]): MarketPair[] {
+  const merged = new Map<string, MarketPair>();
+  for (const pair of previous) merged.set(pair.symbol, pair);
+  for (const pair of incoming) merged.set(pair.symbol, { ...merged.get(pair.symbol), ...pair });
+  return Array.from(merged.values());
 }
 
 const App: React.FC = () => {
@@ -129,130 +139,101 @@ const App: React.FC = () => {
   }, [tradingSignals]);
 
   useEffect(() => {
-    // Create WebSocket connection using the same logic as MLDashboard
-    let wsUrl: string;
-    if (window.location.host.includes('localhost:3000')) {
-      // When running locally in development, use the full WebSocket URL
-      wsUrl = `ws://${window.location.hostname}:8080/ws`;
-    } else {
-      // When running in Docker, use the relative path which will be proxied
-      wsUrl = '/ws';
-    }
-    
+    const wsUrl = resolveWsUrl('/ws');
     console.log(`Connecting to WebSocket at: ${wsUrl}`);
-    const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => {
-      console.log('WebSocket Connected');
-      setConnectionStatus('connected');
-      // ✅ Connection notification removed - status shown in header only
-      setProgress(25); // Indicate initial connection
-    };
+    // Auto-reconnecting: previously a single dropped connection froze the whole
+    // dashboard until the user reloaded the page.
+    const dispose = createReconnectingSocket(wsUrl, {
+      onOpen: () => {
+        console.log('WebSocket Connected');
+        setConnectionStatus('connected');
+        setProgress(25); // Indicate initial connection
+      },
+      onClose: () => {
+        console.log('WebSocket Disconnected, retrying...');
+        setConnectionStatus('disconnected');
+        setProgress(0);
+      },
+      onError: (error) => {
+        console.error('WebSocket Error:', error);
+        setConnectionStatus('disconnected');
+      },
+      onMessage: (event: MessageEvent) => {
+        let message: any;
+        try {
+          message = JSON.parse(event.data);
+        } catch (e) {
+          // A malformed frame used to throw inside the handler and kill the update loop.
+          console.error('Failed to parse websocket message:', e);
+          return;
+        }
 
-    ws.onmessage = (event: MessageEvent) => {
-      const message = JSON.parse(event.data);
-      setUpdatesCount((prev: number) => prev + 1);
+        setUpdatesCount((prev: number) => prev + 1);
 
-      if (message.type === 'initial_data') {
-        setMarketData(message.data);
-        setProgress(50); // Data loaded
-      } else if (message.type === 'market_update') {
-        setMarketData((prevData: MarketPair[]) => {
-          const newDataMap = new Map<string, MarketPair>(message.data.map((item: MarketPair) => [item.symbol, item]));
-          return prevData.map((pair: MarketPair) => newDataMap.get(pair.symbol) || pair);
-        });
-        setProgress(75); // Continuous updates
-      } else if (message.type === 'pump_signal_update') {
-        const signal: PumpSignal = message.data;
-        console.log('Pump Signal:', signal);
-        setPumpSignalsCount((prev: number) => prev + 1);
-        // ✅ Popup removed - signals now shown in table only
+        if (message.type === 'initial_data') {
+          setMarketData(Array.isArray(message.data) ? message.data : []);
+          setProgress(50); // Data loaded
+        } else if (message.type === 'market_update') {
+          const incoming: MarketPair[] = Array.isArray(message.data) ? message.data : [];
+          setMarketData((prevData: MarketPair[]) => mergeMarketData(prevData, incoming));
+          setProgress(75); // Continuous updates
+        } else if (message.type === 'pump_signal_update') {
+          const signal: PumpSignal = message.data;
+          setPumpSignalsCount((prev: number) => prev + 1);
 
-        setMarketData((prevData: MarketPair[]) =>
-          prevData.map((pair: MarketPair) =>
-            pair.symbol === signal.symbol
-              ? { ...pair, anomaly_score: signal.probability * 100, last_update: Date.now() / 1000 }
-              : pair
-          )
-        );
-        setProgress(100); // Anomaly detected
-      } else if (message.type === 'trading_signal_update') {
-        const signal: TradingSignal = message.data;
-        console.log('Trading Signal:', signal);
-        setMlSignalsCount((prev: number) => prev + 1);
-        
-        // ✅ Popup removed - signals now shown in table only
-        
-        // Update trading signals list
-        setTradingSignals((prevSignals: TradingSignal[]) => {
-          // Remove old signal for same symbol if exists
-          const filteredSignals = prevSignals.filter(s => s.symbol !== signal.symbol);
-          // Add new signal
-          const newSignals = [signal, ...filteredSignals];
-          // Keep only last 20 signals
-          return newSignals.slice(0, 20);
-        });
-        setProgress(100); // ML prediction completed
-      } else if (message.type === 'direction_signal') {
-        // 🤖 Handle ML direction signals from analytics engine
-        const dirSignal = message.data;
-        console.log('🤖 Direction Signal:', dirSignal);
-        setMlSignalsCount((prev: number) => prev + 1);
-        
-        // Convert direction signal to trading signal format
-        const tradingSignal: TradingSignal = {
-          symbol: dirSignal.symbol,
-          prediction: dirSignal.direction === 'UP' ? 'BUY' : 
-                     dirSignal.direction === 'DOWN' ? 'SELL' : 'NEUTRAL',
-          confidence: dirSignal.confidence,
-          price_target: dirSignal.price_target,
-          stop_loss: dirSignal.stop_loss || 0,  // ✅ FIXED
-          price_change_pct: dirSignal.price_target && dirSignal.current_price 
-              ? ((dirSignal.price_target - dirSignal.current_price) / dirSignal.current_price) * 100 
+          setMarketData((prevData: MarketPair[]) =>
+            prevData.map((pair: MarketPair) =>
+              pair.symbol === signal.symbol
+                ? { ...pair, anomaly_score: signal.probability * 100, last_update: Date.now() / 1000 }
+                : pair
+            )
+          );
+          setProgress(100); // Anomaly detected
+        } else if (message.type === 'trading_signal_update') {
+          const signal: TradingSignal = message.data;
+          setMlSignalsCount((prev: number) => prev + 1);
+
+          setTradingSignals((prevSignals: TradingSignal[]) => {
+            const filteredSignals = prevSignals.filter(s => s.symbol !== signal.symbol);
+            return [signal, ...filteredSignals].slice(0, 20);
+          });
+          setProgress(100); // ML prediction completed
+        } else if (message.type === 'direction_signal') {
+          // 🤖 Handle ML direction signals from analytics engine
+          const dirSignal = message.data;
+          setMlSignalsCount((prev: number) => prev + 1);
+
+          const tradingSignal: TradingSignal = {
+            symbol: dirSignal.symbol,
+            prediction: toPrediction(String(dirSignal.direction || 'SIDEWAYS')),
+            confidence: toNumber(dirSignal.confidence, 0),
+            price_target: toNumber(dirSignal.price_target, 0),
+            stop_loss: toNumber(dirSignal.stop_loss, 0),
+            price_change_pct: dirSignal.price_target && dirSignal.current_price
+              ? ((toNumber(dirSignal.price_target, 0) - toNumber(dirSignal.current_price, 0)) / Math.max(toNumber(dirSignal.current_price, 1), 1e-9)) * 100
               : 0,
-          risk_level: calculateRiskLevel(dirSignal.confidence, dirSignal.volatility || 0.02),
-          model_used: dirSignal.model_used || 'SimpleNN',
-          time_horizon: `${dirSignal.time_horizon || 60}min`,
-          timestamp: dirSignal.timestamp || Date.now() / 1000,
-          volatility: dirSignal.volatility || 0.02,
-          key_features: ['Technical Analysis', 'ML Prediction'],
-          trust_stage: dirSignal.trust_stage || 'cold_start',
-          model_age_sec: dirSignal.model_age_sec || 0,
-          class_probs: dirSignal.class_probs || { down: 0, sideways: 1, up: 0 }
-        };
-        
-        // ✅ Popup removed - signals now shown in table only
-        
-        // Update trading signals list
-        setTradingSignals((prevSignals: TradingSignal[]) => {
-          // Remove old signal for same symbol if exists
-          const filteredSignals = prevSignals.filter(s => s.symbol !== dirSignal.symbol);
-          // Add new signal
-          const newSignals = [tradingSignal, ...filteredSignals];
-          // Keep only last 20 signals
-          return newSignals.slice(0, 20);
-        });
-        setProgress(100); // ML prediction completed
-      }
-    };
+            risk_level: calculateRiskLevel(toNumber(dirSignal.confidence, 0), toNumber(dirSignal.volatility, 0.02)),
+            model_used: dirSignal.model_used || 'SimpleNN',
+            time_horizon: `${toNumber(dirSignal.time_horizon, 60)}min`,
+            timestamp: toNumber(dirSignal.timestamp, Date.now() / 1000),
+            volatility: toNumber(dirSignal.volatility, 0.02),
+            key_features: ['Technical Analysis', 'ML Prediction'],
+            trust_stage: dirSignal.trust_stage || 'cold_start',
+            model_age_sec: toNumber(dirSignal.model_age_sec, 0),
+            class_probs: dirSignal.class_probs || { down: 0, sideways: 1, up: 0 }
+          };
 
-    ws.onclose = () => {
-      console.log('WebSocket Disconnected');
-      setConnectionStatus('disconnected');
-      // ✅ Disconnection notification removed - status shown in header only
-      setProgress(0);
-    };
+          setTradingSignals((prevSignals: TradingSignal[]) => {
+            const filteredSignals = prevSignals.filter(s => s.symbol !== dirSignal.symbol);
+            return [tradingSignal, ...filteredSignals].slice(0, 20);
+          });
+          setProgress(100); // ML prediction completed
+        }
+      },
+    });
 
-    ws.onerror = (error: Event) => {
-      console.error('WebSocket Error:', error);
-      setConnectionStatus('disconnected');
-      // ✅ Error notification removed - status shown in header only
-      setProgress(0);
-    };
-
-    return () => {
-      ws.close();
-    };
+    return dispose;
   }, []);
 
   // Load infrastructure metrics
@@ -276,8 +257,8 @@ const App: React.FC = () => {
     const loadAnomalyDistribution = async () => {
       try {
         // Load real ML metrics to get anomaly distribution
-        const mlMetrics = await fetchWithFallback('/api/v1/ml/metrics');
-        const signalStats = await fetchWithFallback('/api/v1/ml/signal-stats?symbol=BTCUSDT&hours=24');
+        const mlMetrics = await fetchWithFallback<any>('/api/v1/ml/metrics');
+        const signalStats = await fetchWithFallback<any>('/api/v1/ml/signal-stats?symbol=BTCUSDT&hours=24');
 
         let high = 0, medium = 0, low = 0;
 
@@ -331,11 +312,9 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4">
-      {/* ✅ ToastContainer completely removed to eliminate all popup notifications */}
       <header className="flex justify-between items-center mb-6">
         <div className="flex items-baseline space-x-3">
           <h1 className="text-3xl font-bold">PredPump Radar</h1>
-          <span className="text-sm text-gray-400">(build: {new Date().toLocaleString()})</span>
         </div>
         <div className="flex items-center space-x-4">
           <span className={`text-sm ${connectionStatus === 'connected' ? 'text-green-500' : 'text-red-500'}`}>
@@ -419,24 +398,22 @@ const App: React.FC = () => {
             <StatusDashboard
               wsStatus={connectionStatus}
               kafkaThroughput={
-                infrastructureMetrics?.kafka?.messages_per_sec 
+                infrastructureMetrics?.kafka?.messages_per_sec
                   ? `${Math.round(infrastructureMetrics.kafka.messages_per_sec)} msg/s`
                   : "N/A"
               }
               dbStatus={
-                infrastructureMetrics?.database?.connection_status 
-                  ? infrastructureMetrics.database.connection_status === 'healthy' 
-                    ? 'Connected' 
+                infrastructureMetrics?.database?.connection_status
+                  ? infrastructureMetrics.database.connection_status === 'healthy'
+                    ? 'Connected'
                     : 'Disconnected'
                   : "N/A"
               }
               anomalyDistribution={anomalyDistribution}
             />
-            {/* TODO: Add detailed pair view and charts */}
           </div>
 
           <MarketTable data={marketData} />
-          {/* TODO: Add detailed pair view and charts */}
         </>
       )}
 
