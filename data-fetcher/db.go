@@ -17,6 +17,10 @@ const (
 	dbWriteTimeout = 10 * time.Second
 	dbInitMinDelay = 1 * time.Second
 	dbInitMaxDelay = 30 * time.Second
+
+	candleQueueSize    = 10000
+	candleBatchSize    = 1000
+	candleFlushInterva = 500 * time.Millisecond
 )
 
 var (
@@ -24,6 +28,9 @@ var (
 	// publisher goroutine. Previously this was an unsynchronised global.
 	dbMu sync.RWMutex
 	db   *sql.DB
+
+	candleQueue     = make(chan Candle, candleQueueSize)
+	candleWriterOne sync.Once
 )
 
 const createCandleTableDDL = `CREATE TABLE IF NOT EXISTS candle_1m (
@@ -88,13 +95,15 @@ func connectDB() (*sql.DB, error) {
 // with exponential backoff, so a slow ClickHouse no longer disables writes for
 // the lifetime of the process.
 func InitDB() {
-	if handle, err := connectDB(); err == nil {
+	candleWriterOne.Do(func() { go candleWriterLoop() })
+
+	handle, err := connectDB()
+	if err == nil {
 		setDB(handle)
 		log.Printf("[DB] connected to ClickHouse")
 		return
-	} else {
-		log.Printf("[DB] initial connect failed, retrying in background: %v", err)
 	}
+	log.Printf("[DB] initial connect failed, retrying in background: %v", err)
 
 	go func() {
 		delay := dbInitMinDelay
@@ -118,14 +127,59 @@ func InitDB() {
 	}()
 }
 
-var errDBNotReady = errors.New("db not initialized")
+var (
+	errDBNotReady = errors.New("db not initialized")
+	errQueueFull  = errors.New("candle write queue is full")
+)
 
 const insertCandleSQL = `INSERT INTO candle_1m (symbol, timestamp, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)`
 
-// SaveCandle writes a single candle. Prefer SaveCandles for bulk writes:
-// ClickHouse is far happier with one batch than with N single-row inserts.
+// SaveCandle enqueues a candle for the batching writer. It never blocks the
+// caller: the fetch loop must keep polling the exchange even if ClickHouse is
+// slow or down.
 func SaveCandle(c Candle) error {
-	return SaveCandles([]Candle{c})
+	candleWriterOne.Do(func() { go candleWriterLoop() })
+
+	select {
+	case candleQueue <- c:
+		return nil
+	default:
+		return errQueueFull
+	}
+}
+
+// candleWriterLoop drains the queue into batched inserts.
+func candleWriterLoop() {
+	ticker := time.NewTicker(candleFlushInterva)
+	defer ticker.Stop()
+
+	batch := make([]Candle, 0, candleBatchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := SaveCandles(batch); err != nil {
+			// One retry: the handle may have just been re-established.
+			time.Sleep(time.Second)
+			if err2 := SaveCandles(batch); err2 != nil {
+				log.Printf("[DB] dropped %d candles: %v", len(batch), err2)
+			}
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case c := <-candleQueue:
+			batch = append(batch, c)
+			if len(batch) >= candleBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
 }
 
 // SaveCandles inserts a slice of candles in one batch.
@@ -147,14 +201,14 @@ func SaveCandles(candles []Candle) error {
 	}
 	stmt, err := tx.PrepareContext(ctx, insertCandleSQL)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
 	defer stmt.Close()
 
 	for _, c := range candles {
 		if _, err := stmt.ExecContext(ctx, c.Symbol, c.Timestamp, c.Open, c.High, c.Low, c.Close, c.Volume); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return err
 		}
 	}
