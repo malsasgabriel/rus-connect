@@ -51,6 +51,13 @@ func (r *RateLimiter) Acquire() {
 	}
 }
 
+// Circuit breaker states.
+const (
+	cbClosed = iota
+	cbOpen
+	cbHalfOpen
+)
+
 // CircuitBreaker is a minimal circuit breaker:
 // - closed: allow requests
 // - open: block requests
@@ -58,17 +65,18 @@ func (r *RateLimiter) Acquire() {
 type CircuitBreaker struct {
 	failureCount int
 	maxFailures  int
+	resetTimeout time.Duration
 	resetAfter   time.Time
 	mu           sync.Mutex
-	// State: 0=Closed, 1=Open, 2=Half-Open (simplified)
-	state int
+	state        int
 }
 
 func NewCircuitBreaker(maxFailures int, resetTimeout time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{
-		maxFailures: maxFailures,
-		resetAfter:  time.Now().Add(resetTimeout),
-		state:       0, // Initially closed
+		maxFailures:  maxFailures,
+		resetTimeout: resetTimeout,
+		resetAfter:   time.Now().Add(resetTimeout),
+		state:        cbClosed,
 	}
 }
 
@@ -77,16 +85,16 @@ func (cb *CircuitBreaker) IsOpen() bool {
 	defer cb.mu.Unlock()
 
 	switch cb.state {
-	case 0: // Closed
+	case cbClosed:
 		return false
-	case 1: // Open
+	case cbOpen:
 		if time.Now().After(cb.resetAfter) {
-			cb.state = 2 // Transition to Half-Open
+			cb.state = cbHalfOpen
 			log.Println("Circuit Breaker: Half-Open state (allowing one trial request)")
 			return false // Allow one trial request
 		}
 		return true // Still Open, block requests
-	case 2: // Half-Open
+	case cbHalfOpen:
 		return false // Allow trial request to test if service recovered
 	default:
 		return false
@@ -98,10 +106,16 @@ func (cb *CircuitBreaker) Fail() {
 	defer cb.mu.Unlock()
 
 	cb.failureCount++
-	if cb.failureCount >= cb.maxFailures && cb.state == 0 {
-		cb.state = 1                                     // Transition to Open
-		cb.resetAfter = time.Now().Add(10 * time.Second) // Reset after 10 seconds (example)
-		log.Printf("Circuit Breaker: Open state (failures: %d)", cb.failureCount)
+
+	// A failed trial request in half-open must re-open the breaker immediately.
+	// Previously this branch was gated on state == closed, so once the breaker
+	// reached half-open it stayed there forever and every request was let
+	// through to a failing upstream.
+	if cb.state == cbHalfOpen || (cb.state == cbClosed && cb.failureCount >= cb.maxFailures) {
+		cb.state = cbOpen
+		cb.failureCount = 0
+		cb.resetAfter = time.Now().Add(cb.resetTimeout)
+		log.Printf("Circuit Breaker: Open state (reset after %v)", cb.resetTimeout)
 	}
 }
 
@@ -110,11 +124,11 @@ func (cb *CircuitBreaker) Success() {
 	defer cb.mu.Unlock()
 
 	switch cb.state {
-	case 2: // Half-Open and successful: close it
-		cb.state = 0 // Transition to Closed
+	case cbHalfOpen: // Half-Open and successful: close it
+		cb.state = cbClosed
 		cb.failureCount = 0
 		log.Println("Circuit Breaker: Closed state (success in Half-Open)")
-	case 0: // Closed and successful: reset failures
+	case cbClosed: // Closed and successful: reset failures
 		cb.failureCount = 0
 	}
 }

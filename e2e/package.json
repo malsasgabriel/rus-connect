@@ -1,0 +1,13 @@
+{
+  "name": "rus-connect-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser smoke tests for the PredPump Radar dashboard",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}

@@ -1,0 +1,208 @@
+name: Smoke (docker compose + browser)
+
+# Boots the whole stack on the runner and drives the real dashboard with a real
+# browser. Layer caching keeps the loop short: the first run is slow, later
+# runs reuse cached Go and npm builds.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build images (layer cache)
+        id: build
+        run: |
+          status=0
+          docker buildx bake -f docker-compose.yml \
+            --set '*.cache-from=type=gha' \
+            --set '*.cache-to=type=gha,mode=max' \
+            --load 2>&1 | tail -n 40 \
+            || docker compose build 2>&1 | tail -n 40 \
+            || status=1
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Start the stack
+        id: up
+        if: steps.build.outputs.status == '0'
+        run: |
+          status=0
+          docker compose up -d || status=1
+          docker compose ps
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Kafka topics created by kafka-init
+        id: topics
+        if: steps.up.outputs.status == '0'
+        run: |
+          status=1
+          for _ in $(seq 1 60); do
+            list=$(docker compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list 2>/dev/null || true)
+            echo "$list"
+            missing=0
+            for t in ticker candle_1m direction_signals pump_signals; do
+              echo "$list" | grep -qx "$t" || missing=1
+            done
+            if [ "$missing" = "0" ]; then status=0; break; fi
+            sleep 5
+          done
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for health endpoints
+        id: probe
+        if: steps.up.outputs.status == '0'
+        run: |
+          probe() {
+            name="$1"; url="$2"; deadline=$((SECONDS + 300))
+            while [ $SECONDS -lt $deadline ]; do
+              if curl -fsS --max-time 3 "$url" > /dev/null; then
+                echo "OK   $name after ${SECONDS}s"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "FAIL $name ($url) after 300s"
+            return 1
+          }
+          status=0
+          probe analytics-engine http://localhost:8081/healthz || status=1
+          probe api-gateway      http://localhost:8080/healthz || status=1
+          probe data-fetcher     http://localhost:8083/healthz || status=1
+          probe websocket-server http://localhost:8082/healthz || status=1
+          probe frontend         http://localhost:3000/        || status=1
+          probe frontend-health  http://localhost:3000/healthz  || status=1
+          # readyz is green only if the gateway can really reach the ML engine
+          probe gateway-ready    http://localhost:8080/readyz   || status=1
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.up.outputs.status == '0'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Playwright browsers
+        if: steps.up.outputs.status == '0'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('e2e/package.json') }}
+          restore-keys: playwright-
+
+      - name: Install Playwright
+        if: steps.up.outputs.status == '0'
+        working-directory: e2e
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Browser tests
+        id: e2e
+        if: steps.up.outputs.status == '0'
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: http://localhost:3000
+        run: |
+          set +e
+          npx playwright test 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect state and logs
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/smoke.log"
+          {
+            echo '--- docker compose ps ---'
+            docker compose ps || true
+            echo
+            for svc in kafka-init data-fetcher analytics-engine api-gateway frontend; do
+              echo "--- logs: $svc (tail 60) ---"
+              docker compose logs --tail 60 "$svc" 2>&1 || true
+              echo
+            done
+          } > "$out"
+          cat "$out"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: |
+            ${{ runner.temp }}/smoke.log
+            ${{ runner.temp }}/e2e.log
+            e2e/playwright-report
+            e2e/test-results
+            e2e/screenshots
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report result on the pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANCELLED: ${{ cancelled() }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          build='${{ steps.build.outputs.status }}'
+          up='${{ steps.up.outputs.status }}'
+          topics='${{ steps.topics.outputs.status }}'
+          probe='${{ steps.probe.outputs.status }}'
+          e2e='${{ steps.e2e.outputs.status }}'
+          if [ "$CANCELLED" = "true" ]; then
+            # Superseded by a newer push: not a real result, so say so.
+            title='### Smoke cancelled (superseded by a newer commit)'
+          elif [ "$build" = "0" ] && [ "$up" = "0" ] && [ "$topics" = "0" ] && [ "$probe" = "0" ] && [ "$e2e" = "0" ]; then
+            title='### Smoke OK: images built, stack up, topics created, health endpoints answered, browser tests passed'
+          else
+            title='### Smoke FAILED'
+          fi
+          body="$RUNNER_TEMP/comment.md"
+          {
+            echo "$title"
+            echo
+            echo "| stage | result (0 = ok) |"
+            echo "| --- | --- |"
+            echo "| image build | ${build:-skipped} |"
+            echo "| compose up | ${up:-skipped} |"
+            echo "| kafka topics | ${topics:-skipped} |"
+            echo "| health probes | ${probe:-skipped} |"
+            echo "| playwright | ${e2e:-skipped} |"
+            echo
+            echo "Commit \`${{ github.sha }}\` - [full run and artifacts]($run_url)"
+            echo
+            echo '#### playwright'
+            echo '```'
+            tail -n 120 "$RUNNER_TEMP/e2e.log" 2>/dev/null || echo 'browser tests did not run'
+            echo '```'
+            echo '#### containers'
+            echo '```'
+            tail -n 200 "$RUNNER_TEMP/smoke.log" 2>/dev/null || echo 'no container log collected'
+            echo '```'
+          } > "$body"
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$body"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+      - name: Fail if anything went wrong
+        if: steps.build.outputs.status != '0' || steps.up.outputs.status != '0' || steps.topics.outputs.status != '0' || steps.probe.outputs.status != '0' || steps.e2e.outputs.status != '0'
+        run: exit 1

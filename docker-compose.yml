@@ -1,3 +1,6 @@
+x-clickhouse-dsn: &clickhouse-dsn
+  CH_DSN: clickhouse://${CLICKHOUSE_USER:-app}:${CLICKHOUSE_PASSWORD:-app_password}@clickhouse:9000/${CLICKHOUSE_DB:-default}?dial_timeout=5s&max_execution_time=60
+
 services:
   data-fetcher:
     build:
@@ -5,31 +8,34 @@ services:
       dockerfile: Dockerfile
     networks:
       - predpump-network
-      - default  # Allow access to external APIs
+      - default # Allow access to external APIs
     restart: on-failure
+    # Published so health and metrics are reachable from the host (and from CI).
+    ports:
+      - "8083:8083"
     environment:
-      - KAFKA_BROKERS=kafka:9092
-      - CH_DSN=clickhouse://app:app_password@clickhouse:9000/default?dial_timeout=5s&max_execution_time=60
-      - DATA_FETCHER_PORT=8083
+      <<: *clickhouse-dsn
+      KAFKA_BROKERS: kafka:9092
+      DATA_FETCHER_PORT: "8083"
+      BYBIT_BASE_URL: ${BYBIT_BASE_URL:-https://api.bybit.com}
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
-    command: ["/bin/sh", "-c", "sleep 5 && /app/data-fetcher"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8083/healthz"]
       interval: 15s
       timeout: 5s
       retries: 8
       start_period: 30s
-    # Memory limit: 256MB
     deploy:
       resources:
         limits:
           memory: 256M
         reservations:
           memory: 128M
+
   analytics-engine:
     build:
       context: ./analytics-engine
@@ -38,34 +44,34 @@ services:
       - predpump-network
     restart: on-failure
     environment:
-      - KAFKA_BROKERS=kafka:9092
-      - CH_DSN=clickhouse://app:app_password@clickhouse:9000/default?dial_timeout=5s&max_execution_time=60
-      - CONFIDENCE_THRESHOLD=0.10
-      - ML_MIN_CANDLES_BOOTSTRAP=20
-      - ML_MIN_CANDLES=60
-      - ANALYTICS_ENGINE_PORT=8081
+      <<: *clickhouse-dsn
+      KAFKA_BROKERS: kafka:9092
+      CONFIDENCE_THRESHOLD: "0.10"
+      ML_MIN_CANDLES_BOOTSTRAP: "20"
+      ML_MIN_CANDLES: "60"
+      ANALYTICS_ENGINE_PORT: "8081"
     depends_on:
       redis:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
     ports:
       - "8081:8081"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
-    # Memory limit: 512MB (ML model training requires more memory)
     deploy:
       resources:
         limits:
           memory: 512M
         reservations:
           memory: 256M
+
   api-gateway:
     build:
       context: .
@@ -76,29 +82,61 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - KAFKA_BROKERS=kafka:9092
-      - ANALYTICS_ENGINE_URL=http://analytics-engine:8081
-      - API_GATEWAY_PORT=8080
+      KAFKA_BROKERS: kafka:9092
+      ANALYTICS_ENGINE_URL: http://analytics-engine:8081
+      API_GATEWAY_PORT: "8080"
+      # Browser origins allowed to open the websocket. The frontend is served
+      # from :3000, and nginx forwards the original Origin header.
+      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     depends_on:
       redis:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       analytics-engine:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
       interval: 15s
       timeout: 5s
       retries: 8
-      start_period: 30s
-    # Memory limit: 256MB
+      start_period: 20s
     deploy:
       resources:
         limits:
           memory: 256M
         reservations:
           memory: 128M
+
+  websocket-server:
+    build:
+      context: ./websocket-server
+      dockerfile: Dockerfile
+    networks:
+      - predpump-network
+    restart: on-failure
+    ports:
+      - "8082:8082"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      PORT: "8082"
+      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8082/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
   frontend:
     build:
       context: ./frontend
@@ -108,17 +146,26 @@ services:
     restart: on-failure
     ports:
       - "3000:80"
-    environment:
-      - VITE_API_URL=http://api-gateway:8080
+    # No VITE_API_URL here: Vite inlines env vars at build time, and
+    # http://api-gateway:8080 is not resolvable from the user's browser.
+    # nginx proxies /api and /ws to the gateway on the same origin instead.
     depends_on:
-      - api-gateway
-    # Memory limit: 128MB
+      api-gateway:
+        condition: service_healthy
+    # 127.0.0.1, not localhost: busybox wget tries ::1 first.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     deploy:
       resources:
         limits:
           memory: 128M
         reservations:
           memory: 64M
+
   redis:
     image: redis:7-alpine
     networks:
@@ -128,23 +175,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-    # Memory limit: 256MB
     deploy:
       resources:
         limits:
           memory: 256M
         reservations:
           memory: 128M
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     networks:
       - predpump-network
     environment:
-      - CLICKHOUSE_DB=default
-      - CLICKHOUSE_USER=app
-      - CLICKHOUSE_PASSWORD=app_password
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-app}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-app_password}
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8123/ping"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -160,6 +207,7 @@ services:
           memory: 1G
         reservations:
           memory: 512M
+
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     hostname: kafka
@@ -168,6 +216,7 @@ services:
     restart: on-failure
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -176,34 +225,38 @@ services:
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_NUM_PARTITIONS: 1
       KAFKA_HEAP_OPTS: -Xmx512M -Xms256M
-      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
-      KAFKA_ZOOKEEPER_SET_ACL: 'false'
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      KAFKA_CREATE_TOPICS: "candle_1m:1:1,direction_signals:1:1,orderbook:1:1,trades:1:1"
+      KAFKA_ZOOKEEPER_SET_ACL: "false"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
-      KAFKA_AUTO_LEADER_REBALANCE_ENABLE: 'true'
+      KAFKA_AUTO_LEADER_REBALANCE_ENABLE: "true"
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_JMX_PORT: 9101
       KAFKA_JMX_HOSTNAME: localhost
-      # Additional settings to ensure topics are created
-      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: 'false'
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
     depends_on:
       zookeeper:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 30s
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 10s
       timeout: 10s
       retries: 20
-      start_period: 180s  # Increased start period to allow more time for zookeeper to be ready
-    # Memory limit: 1GB (Kafka requires significant memory for buffering)
+      # 180s of dead time before the first probe made every `up` feel broken.
+      start_period: 60s
     deploy:
       resources:
         limits:
@@ -212,6 +265,29 @@ services:
           memory: 512M
     volumes:
       - kafka_data:/var/lib/kafka/data
+
+  # KAFKA_CREATE_TOPICS only works on wurstmeister/kafka; on cp-kafka it was
+  # silently ignored. Note the single-item list below: a block scalar gets
+  # re-split into words by compose, which made bash run `bash -c set` and
+  # skip topic creation entirely.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    networks:
+      - predpump-network
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        for topic in ticker orderbook trades candle_1m direction_signals pump_signals; do
+          kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+        echo "--- topics now present ---"
+        kafka-topics --bootstrap-server kafka:9092 --list
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
@@ -224,17 +300,15 @@ services:
       ZOOKEEPER_HEAP_OPTS: -Xmx512M -Xms256M
       ZOOKEEPER_INIT_LIMIT: 5
       ZOOKEEPER_SYNC_LIMIT: 2
-      ZOOKEEPER_MAX_CLIENT_CNXNS: 0  # Allow unlimited connections
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 0
       ZOOKEEPER_AUTOPURGE_SNAPRETAINCOUNT: 3
       ZOOKEEPER_AUTOPURGE_PURGEINTERVAL: 0
-    # NOTE: Skipping healthcheck for zookeeper to avoid issues with /dev/tcp and timeout in alpine container
     healthcheck:
       test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 30s
-    # Memory limit: 512MB
+      retries: 10
+      start_period: 15s
     deploy:
       resources:
         limits:

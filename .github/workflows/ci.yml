@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  go:
+    name: ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - api-gateway
+          - analytics-engine
+          - data-fetcher
+          - websocket-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: vet / build / test
+        id: check
+        working-directory: ${{ matrix.module }}
+        run: |
+          log="$RUNNER_TEMP/${{ matrix.module }}.log"
+          : > "$log"
+          status=0
+          run_step() {
+            echo "### $*" >> "$log"
+            if ! "$@" >> "$log" 2>&1; then
+              status=1
+              echo "^^^ FAILED: $*" >> "$log"
+            fi
+            echo >> "$log"
+          }
+          run_step go vet ./...
+          run_step go build ./...
+          run_step go test -race ./...
+          cat "$log"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "log=$log" >> "$GITHUB_OUTPUT"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-${{ matrix.module }}
+          path: ${{ steps.check.outputs.log }}
+          if-no-files-found: ignore
+
+      - name: Report result on the pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body="$RUNNER_TEMP/comment.md"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ steps.check.outputs.status }}" = "0" ]; then
+            echo "CI OK: \`${{ matrix.module }}\` - vet, build and \`go test -race\` all passed (\`${{ github.sha }}\`, [run]($run_url))" > "$body"
+          else
+            {
+              echo "### CI FAILED: \`${{ matrix.module }}\`"
+              echo
+              echo "Commit \`${{ github.sha }}\` - [full log]($run_url)"
+              echo
+              echo '```'
+              tail -n 150 "${{ steps.check.outputs.log }}" 2>/dev/null || echo 'no log captured'
+              echo '```'
+            } > "$body"
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$body"
+
+      - name: Fail the job if any step failed
+        if: steps.check.outputs.status == '1'
+        run: exit 1

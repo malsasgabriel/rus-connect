@@ -18,9 +18,8 @@ RUN go mod download && go mod verify
 # Copy the rest of api-gateway source code
 COPY api-gateway/ ./
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags='-w -s -extldflags "-static"' \
-    -a -installsuffix cgo \
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags='-w -s' \
     -o api-gateway .
 
 # Stage 2: Runtime
@@ -38,7 +37,9 @@ USER appuser
 
 EXPOSE 8080
 
+# Was /api/v1/infrastructure/metrics, which proxies analytics-engine: the
+# gateway was marked unhealthy whenever a downstream service was down.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/api/v1/infrastructure/metrics || exit 1
+    CMD curl -f http://localhost:8080/healthz || exit 1
 
 CMD ["./api-gateway"]
